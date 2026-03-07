@@ -1282,6 +1282,7 @@ dependencies = [
  "gpio-cdev",
  "hyper",
  "i2cdev",
+ "libc",
  "nix 0.31.2",
  "once_cell",
  "parking_lot",

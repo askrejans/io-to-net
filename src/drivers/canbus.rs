@@ -9,6 +9,8 @@ use crate::error::{IoToNetError, Result};
 
 use super::IoDriver;
 
+#[cfg(target_os = "linux")]
+use socketcan::Frame;
 /// CAN bus driver using socketcan (Linux only).
 /// Each CAN frame is serialised as: [ID:4 bytes LE][DLC:1 byte][data:0-8 bytes]
 pub struct CanbusDriver {
