@@ -155,11 +155,26 @@ pub struct I2cConfig {
     pub read_len: usize,
     /// Poll interval in milliseconds
     pub poll_ms: u64,
+    /// Register address to write before each read (sets the device's internal register pointer).
+    /// Required for most I2C sensors — e.g. 0x3B for MPU-6050 accelerometer, 0x28 for LSM6DS3.
+    /// Omit only if the device streams data without needing a register select.
+    pub read_reg: Option<u8>,
+    /// Initialization sequences sent to the device on open, before the first read.
+    /// Each inner array is one I2C write transaction.
+    /// Example for MPU-6050 (wake from sleep): [[0x6B, 0x00]]
+    pub init_bytes: Vec<Vec<u8>>,
 }
 
 impl Default for I2cConfig {
     fn default() -> Self {
-        I2cConfig { bus: "/dev/i2c-1".to_string(), address: 0x68, read_len: 6, poll_ms: 100 }
+        I2cConfig {
+            bus: "/dev/i2c-1".to_string(),
+            address: 0x68,
+            read_len: 6,
+            poll_ms: 100,
+            read_reg: None,
+            init_bytes: Vec::new(),
+        }
     }
 }
 
