@@ -298,6 +298,7 @@ async fn run_bridge(
                             let stats = detector.stats();
                             let mut m = metrics.write();
                             if let Some(bm) = m.bridges.get_mut(&cfg.name) {
+                                bm.add_rx(n as u64);
                                 bm.protocol_hint = detector.hint().clone();
                                 bm.message_rate = stats.message_rate;
                                 bm.avg_frame_size = stats.avg_frame_size;
