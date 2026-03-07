@@ -307,7 +307,7 @@ async fn run_bridge(
                     backoff_ms = (backoff_ms * 2).min(10000);
                 }
                 // Instead of continue, run client loop with no hardware
-                run_client_loop(&mut conn_mgr, &mut new_client_rx, None);
+                run_client_loop(&mut conn_mgr, &mut new_client_rx, None).await;
                 continue;
             }
         };
@@ -329,18 +329,18 @@ async fn run_bridge(
                     backoff_ms = (backoff_ms * 2).min(10000);
                 }
                 // Instead of continue, run client loop with no hardware
-                run_client_loop(&mut conn_mgr, &mut new_client_rx, None);
+                run_client_loop(&mut conn_mgr, &mut new_client_rx, None).await;
                 continue;
             }
         }
 
         // Main bridge loop: process clients and hardware reads
-        run_client_loop(&mut conn_mgr, &mut new_client_rx, Some(&mut driver));
+        run_client_loop(&mut conn_mgr, &mut new_client_rx, driver.as_deref_mut()).await;
     }
 
 }
 
-fn run_client_loop(
+async fn run_client_loop(
     conn_mgr: &mut crate::core::connection_manager::ConnectionManager,
     new_client_rx: &mut tokio::sync::mpsc::Receiver<crate::transports::ClientHandle>,
     driver: Option<&mut dyn crate::drivers::IoDriver>,
