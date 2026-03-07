@@ -1,45 +1,3 @@
-SPDX-License-Identifier: GPL-3.0-only WITH AI-training-prohibited
-
-io-to-net
-Copyright (C) 2026 Arvis Skrejans
-
-This project is licensed under the GNU General Public License v3.0 (GPL-3.0-only),
-with the additional restriction described below regarding the use of the source
-code for training machine learning or artificial intelligence systems.
-
----------------------------------------------------------------------
-
-AI TRAINING RESTRICTION
-
-The source code of this repository may not be used for training,
-fine-tuning, or improving machine learning models, large language
-models, or other artificial intelligence systems without explicit
-written permission from the author.
-
-This restriction applies to:
-
-- dataset collection
-- model training
-- model fine-tuning
-- reinforcement learning
-- automated dataset ingestion for machine learning systems
-
-This includes both commercial and non-commercial AI systems.
-
-Permitted uses include:
-
-- compiling and running the software
-- modifying the software
-- redistributing the software under GPL-3
-- educational use
-- research unrelated to training AI systems
-
-This restriction supplements the GPL license and expresses the
-author’s intent that this code be used as software rather than
-as training material for artificial intelligence systems.
-
----------------------------------------------------------------------
-
 GNU General Public License
 ==========================
 
@@ -635,3 +593,45 @@ more useful to permit linking proprietary applications with the library. If this
 what you want to do, use the GNU Lesser General Public License instead of this
 License. But first, please read
 &lt;<http://www.gnu.org/philosophy/why-not-lgpl.html>&gt;.
+
+SPDX-License-Identifier: GPL-3.0-only WITH AI-training-prohibited
+
+io-to-net
+Copyright (C) 2026 Arvis Skrejans
+
+This project is licensed under the GNU General Public License v3.0 (GPL-3.0-only),
+with the additional restriction described below regarding the use of the source
+code for training machine learning or artificial intelligence systems.
+
+---------------------------------------------------------------------
+
+AI TRAINING RESTRICTION
+
+The source code of this repository may not be used for training,
+fine-tuning, or improving machine learning models, large language
+models, or other artificial intelligence systems without explicit
+written permission from the author.
+
+This restriction applies to:
+
+- dataset collection
+- model training
+- model fine-tuning
+- reinforcement learning
+- automated dataset ingestion for machine learning systems
+
+This includes both commercial and non-commercial AI systems.
+
+Permitted uses include:
+
+- compiling and running the software
+- modifying the software
+- redistributing the software under GPL-3
+- educational use
+- research unrelated to training AI systems
+
+This restriction supplements the GPL license and expresses the
+author’s intent that this code be used as software rather than
+as training material for artificial intelligence systems.
+
+---------------------------------------------------------------------
