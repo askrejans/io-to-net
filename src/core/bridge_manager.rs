@@ -335,7 +335,7 @@ async fn run_bridge(
         }
 
         // Main bridge loop: process clients and hardware reads
-        run_client_loop(&mut conn_mgr, &mut new_client_rx, driver.as_mut()).await;
+        run_client_loop(&mut conn_mgr, &mut new_client_rx, Some(driver.as_mut())).await;
     }
 
 }
@@ -343,7 +343,7 @@ async fn run_bridge(
 async fn run_client_loop(
     conn_mgr: &mut crate::core::connection_manager::ConnectionManager,
     new_client_rx: &mut tokio::sync::mpsc::Receiver<crate::transports::ClientHandle>,
-    driver: Option<&mut dyn crate::drivers::IoDriver>,
+    mut driver: Option<&mut dyn crate::drivers::IoDriver>,
 ) {
     let mut buf = [0u8; 4096];
     loop {
