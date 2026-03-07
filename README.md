@@ -1,13 +1,5 @@
 # io-to-net
 
-# Project Status
-
-Active development. Not expected to work yet. Tested with I2C sensors in read only mode. These and serial ports should work. Framing works and essential for I2C.
-
-Contributions and feedback welcome.
-
-
--------
 **io-to-net** is an **Edge Hardware Networking Layer** that exposes local hardware interfaces over TCP/IP.
 
 It allows devices connected to a machine (serial, I²C, GPIO, Bluetooth, CAN, etc.) to be accessed remotely as if they were locally connected.
@@ -18,13 +10,14 @@ The system acts as a transparent byte-stream bridge between hardware interfaces 
 hardware device → io-to-net → TCP/IP → application
 ```
 
-io-to-net is designed as the transport layer for telemetry pipelines such as:
+![io](https://github.com/user-attachments/assets/b0280c3f-d343-42a9-8407-4d3e9cb14634)
 
-- speeduino-to-mqtt
-- gps-to-mqtt
-- sensors-to-mqtt
 
-Together these tools form a modular open telemetry stack.
+# Project Status
+
+Active development. Not all is expected to work yet. Tested with I2C sensors in read only mode. These and serial ports should work. Framing works and essential for I2C.
+
+Contributions and feedback welcome.
 
 ---
 
