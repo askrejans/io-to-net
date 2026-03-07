@@ -1,0 +1,101 @@
+[package]
+name = "io-to-net"
+version = "0.1.0"
+edition = "2024"
+description = "Universal hardware IO bridge — exposes local hardware interfaces over TCP/IP"
+license = "GPL-3.0"
+repository = "https://github.com/io-to-net/io-to-net"
+keywords = ["serial", "bridge", "hardware", "tcp", "iot"]
+categories = ["network-programming", "hardware-support"]
+
+[[bin]]
+name = "io-to-net"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enable Linux-specific hardware drivers
+linux-drivers = []
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serialisation / config
+serde = { version = "1", features = ["derive"] }
+toml = "0.9.8"
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2.0.18"
+
+# Serial port
+serialport = "4.8.1"
+tokio-serial = "5"
+
+# TLS
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rcgen = "0.14.7"
+
+# WebSocket
+tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }
+
+# HTTP admin API
+axum = { version = "0.8.8", features = ["json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+hyper = { version = "1", features = ["full"] }
+
+# Prometheus metrics
+prometheus = { version = "0.14.0", features = ["process"] }
+
+# TUI
+ratatui = "0.30.0"
+crossterm = "0.29.0"
+
+# Logging / observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Utilities
+bytes = "1"
+parking_lot = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+once_cell = "1"
+regex = "1"
+
+# Bluetooth / BLE
+btleplug = "0.11"
+
+# Unix / platform
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.2", features = ["ioctl", "fs", "term", "process", "signal"] }
+
+# Linux-specific hardware drivers
+[target.'cfg(target_os = "linux")'.dependencies]
+i2cdev = "0.6"
+gpio-cdev = "0.6"
+socketcan = "3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

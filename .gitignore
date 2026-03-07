@@ -1,0 +1,11 @@
+# Build output
+target/
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Firmware secrets — copy secrets.h.example to secrets.h to configure
+firmware/src/secrets.h
+
+# macOS
+.DS_Store

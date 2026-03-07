@@ -1,0 +1,147 @@
+# io-to-net configuration
+# Copy to /etc/io-to-net/config.toml and edit as needed.
+
+# Global log level: trace | debug | info | warn | error
+log_level = "info"
+
+# ─── HTTP Admin API ──────────────────────────────────────────────
+[http_api]
+enabled = true
+listen = "0.0.0.0:9106"
+
+# Optional Bearer token authentication
+# [http_api.auth]
+# token = "change-me-in-production"
+
+# Optional per-second rate limit
+# rate_limit_per_second = 20
+
+# ─── Prometheus Metrics ──────────────────────────────────────────
+[metrics]
+enabled = true
+listen = "0.0.0.0:9105"
+
+# ─── Bridges ─────────────────────────────────────────────────────
+# Each [[bridges]] block creates one IO→TCP bridge.
+
+# ── Example 1: Serial ECU over TCP ───────────────────────────────
+[[bridges]]
+name = "ecu"
+max_clients = 10
+mode = "mirror"     # mirror | exclusive | proxy
+read_only = false   # true = clients cannot send data to device
+auto_restart = true
+
+[bridges.source]
+type = "serial"
+port = "/dev/ttyUSB0"
+baud = 115200
+data_bits = 8
+parity = "none"     # none | odd | even
+stop_bits = 1
+flow_control = "none" # none | software | hardware
+
+[bridges.transport]
+type = "tcp"
+listen = "[::]:9000"
+write_timeout_ms = 5000
+
+# ── Example 2: Bluetooth OBD-II adapter ──────────────────────────
+# [[bridges]]
+# name = "obd"
+# read_only = true
+# auto_restart = true
+#
+# [bridges.source]
+# type = "bluetooth"
+# device = "AA:BB:CC:DD:EE:FF"
+# # Optional BLE GATT characteristic UUID
+# # characteristic_uuid = "0000ffe1-0000-1000-8000-00805f9b34fb"
+#
+# [bridges.transport]
+# type = "tcp"
+# listen = "[::]:9001"
+
+# ── Example 3: I2C sensor (Linux only) ───────────────────────────
+# [[bridges]]
+# name = "imu"
+# read_only = true
+#
+# [bridges.source]
+# type = "i2c"
+# bus = "/dev/i2c-1"
+# address = 0x68    # MPU-6050 default address
+# read_len = 14
+# poll_ms = 10
+#
+# [bridges.transport]
+# type = "tcp"
+# listen = "[::]:9002"
+
+# ── Example 4: CAN bus (Linux only) ──────────────────────────────
+# [[bridges]]
+# name = "can0"
+# read_only = true
+#
+# [bridges.source]
+# type = "canbus"
+# interface = "can0"
+#
+# [bridges.transport]
+# type = "tcp"
+# listen = "[::]:9003"
+
+# ── Example 5: TLS-encrypted TCP bridge ──────────────────────────
+# [[bridges]]
+# name = "ecu-tls"
+# auto_restart = true
+#
+# [bridges.source]
+# type = "serial"
+# port = "/dev/ttyUSB1"
+# baud = 115200
+#
+# [bridges.transport]
+# type = "tls"
+# listen = "[::]:9443"
+# cert = "/etc/io-to-net/cert.pem"
+# key = "/etc/io-to-net/key.pem"
+
+# ── Example 6: WebSocket bridge ──────────────────────────────────
+# [[bridges]]
+# name = "ecu-ws"
+#
+# [bridges.source]
+# type = "serial"
+# port = "/dev/ttyUSB0"
+# baud = 115200
+#
+# [bridges.transport]
+# type = "web_socket"
+# listen = "[::]:9080"
+
+# ── Example 7: PTY (pseudo-terminal, Unix only) ───────────────────
+# [[bridges]]
+# name = "pty-bridge"
+#
+# [bridges.source]
+# type = "pty"
+# symlink = "/tmp/io-to-net-pty"
+#
+# [bridges.transport]
+# type = "tcp"
+# listen = "[::]:9004"
+
+# ── Example 8: 1-Wire temperature sensor (Linux only) ────────────
+# [[bridges]]
+# name = "temp"
+# read_only = true
+#
+# [bridges.source]
+# type = "onewire"
+# device = "/sys/bus/w1/devices/28-000000000000"
+# poll_ms = 1000
+#
+# [bridges.transport]
+# type = "tcp"
+# listen = "[::]:9005"

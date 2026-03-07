@@ -1,0 +1,31 @@
+[Unit]
+Description=io-to-net — Universal hardware IO bridge
+Documentation=https://github.com/io-to-net/io-to-net
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/io-to-net --daemon --config /etc/io-to-net/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/io-to-net
+PrivateTmp=true
+
+# Required for hardware access
+SupplementaryGroups=dialout gpio i2c
+
+Environment=IO_TO_NET_LOG_LEVEL=info
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=io-to-net
+
+[Install]
+WantedBy=multi-user.target
