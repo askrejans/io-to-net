@@ -335,7 +335,7 @@ async fn run_bridge(
         }
 
         // Main bridge loop: process clients and hardware reads
-        run_client_loop(&mut conn_mgr, &mut new_client_rx, driver.as_deref_mut()).await;
+        run_client_loop(&mut conn_mgr, &mut new_client_rx, driver.as_mut().map(|d| &mut **d)).await;
     }
 
 }
@@ -368,7 +368,7 @@ async fn run_client_loop(
             // Data from driver (hardware → broadcast to clients)
             // Only if driver is available
             read_result = async {
-                if let Some(d) = driver {
+                if let Some(d) = driver.as_mut() {
                     d.read(&mut buf).await
                 } else {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
