@@ -236,30 +236,30 @@ async fn run_bridge(
     let max_clients = cfg.max_clients;
     let read_only = cfg.read_only;
 
-    // Spawn transport listener
-    {
-        let transport_cfg = cfg.transport.clone();
-        let tx_clone = new_client_tx.clone();
-        let _shutdown_rx = shutdown;
-        let (sd_tx, _) = broadcast::channel::<()>(1);
-        let sd_rx = sd_tx.subscribe();
+    // Await transport listener startup and propagate errors
+    let transport_cfg = cfg.transport.clone();
+    let tx_clone = new_client_tx.clone();
+    let _shutdown_rx = shutdown;
+    let (sd_tx, _) = broadcast::channel::<()>(1);
+    let sd_rx = sd_tx.subscribe();
 
-        tokio::spawn(async move {
-            match transport_cfg {
-                TransportConfig::Tcp(tcp_cfg) => {
-                    let _ = tcp::run_tcp_listener(tcp_cfg, tx_clone, max_clients, sd_rx).await;
-                }
-                TransportConfig::Tls(tls_cfg) => {
-                    let _ = tls::run_tls_listener(tls_cfg, tx_clone, max_clients, sd_rx).await;
-                }
-                TransportConfig::WebSocket(ws_cfg) => {
-                    let _ = websocket::run_ws_listener(ws_cfg, tx_clone, max_clients, sd_rx).await;
-                }
-            }
-        });
-        // Hold sd_tx alive so listener gets shutdown when we drop it on bridge end
-        let _ = sd_tx; // keep alive; will drop at task end
+    let transport_result = match transport_cfg {
+        TransportConfig::Tcp(tcp_cfg) => {
+            tcp::run_tcp_listener(tcp_cfg, tx_clone, max_clients, sd_rx).await
+        }
+        TransportConfig::Tls(tls_cfg) => {
+            tls::run_tls_listener(tls_cfg, tx_clone, max_clients, sd_rx).await
+        }
+        TransportConfig::WebSocket(ws_cfg) => {
+            websocket::run_ws_listener(ws_cfg, tx_clone, max_clients, sd_rx).await
+        }
+    };
+    if let Err(e) = transport_result {
+        error!(bridge = %cfg.name, error = %e, "Transport listener failed to start");
+        return Err(e);
     }
+    // Hold sd_tx alive so listener gets shutdown when we drop it on bridge end
+    let _ = sd_tx; // keep alive; will drop at task end
 
     let mut buf = [0u8; 4096];
     let mut detector = ProtocolDetector::new();
