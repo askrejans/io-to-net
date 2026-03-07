@@ -31,6 +31,13 @@ max_clients = 10
 mode = "mirror"     # mirror | exclusive | proxy
 read_only = false   # true = clients cannot send data to device
 auto_restart = true
+# frame_mode controls how data is packaged before sending to TCP clients.
+# Omit (or set "none") for raw streaming — client handles its own framing.
+# Options: none | length_prefix | line | null_terminated
+# frame_mode = "none"        # default — raw byte stream
+# frame_mode = "line"        # emit one complete line per \n (NMEA, AT commands)
+# frame_mode = "null_terminated"  # emit one packet per 0x00 byte (COBS streams)
+# frame_mode = "length_prefix"    # prepend [u16 len][data] (I2C, SPI sensor reads)
 
 [bridges.source]
 type = "serial"
@@ -62,21 +69,65 @@ write_timeout_ms = 5000
 # type = "tcp"
 # listen = "[::]:9001"
 
-# ── Example 3: I2C sensor (Linux only) ───────────────────────────
+# ── Example 3: I2C IMU — MPU-6050 (Linux only) ───────────────────
+# Exposes raw accelerometer + gyroscope data (14 bytes) over TCP.
+#
+# Key I2C options:
+#   read_reg   — register address written before each read to set the
+#                device's internal pointer. Required for most sensors.
+#                MPU-6050 accel/gyro data starts at 0x3B.
+#   init_bytes — list of write transactions sent once on open.
+#                MPU-6050 powers up in sleep mode; [0x6B, 0x00] wakes it.
+#                Each inner array is a single I2C write transaction.
+#
+# Clients always connect even if the hardware is offline or being
+# retried — the port stays open and data flows once the device is ready.
+#
 # [[bridges]]
 # name = "imu"
 # read_only = true
+# auto_restart = true
+# frame_mode = "length_prefix"  # prepend each 14-byte read with a 2-byte length
+#                                # client: read 2 bytes → u16 len, then read len bytes
 #
 # [bridges.source]
 # type = "i2c"
 # bus = "/dev/i2c-1"
-# address = 0x68    # MPU-6050 default address
-# read_len = 14
-# poll_ms = 10
+# address = 0x68          # MPU-6050 default I2C address
+# read_len = 14           # accel XYZ (6) + temp (2) + gyro XYZ (6)
+# poll_ms = 10            # 100 Hz polling
+# read_reg = 0x3B         # ACCEL_XOUT_H — start of accel data block
+# init_bytes = [[0x6B, 0x00]]  # PWR_MGMT_1 = 0x00: wake from sleep
 #
 # [bridges.transport]
 # type = "tcp"
 # listen = "[::]:9002"
+
+# ── Example 3b: I2C pressure sensor — BMP280 (Linux only) ────────
+# BMP280 at 0x77, read 8 raw bytes from 0xF7 after config.
+# Two init writes: set oversampling mode, then set standby time.
+#
+# [[bridges]]
+# name = "baro"
+# read_only = true
+# auto_restart = true
+# frame_mode = "length_prefix"
+#
+# [bridges.source]
+# type = "i2c"
+# bus = "/dev/i2c-1"
+# address = 0x77
+# read_len = 8
+# poll_ms = 50
+# read_reg = 0xF7
+# init_bytes = [
+#   [0xF4, 0x2F],   # ctrl_meas: temp×1, press×1, normal mode
+#   [0xF5, 0xA0],   # config: standby 1s, filter off
+# ]
+#
+# [bridges.transport]
+# type = "tcp"
+# listen = "[::]:9003"
 
 # ── Example 4: CAN bus (Linux only) ──────────────────────────────
 # [[bridges]]

@@ -16,7 +16,7 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 8;
 /// A run is considered healthy (resets backoff) if it lasted at least this long.
 const HEALTHY_RUN_SECS: u64 = 30;
 
-use crate::config::{AppConfig, BridgeConfig, TransportConfig};
+use crate::config::{AppConfig, BridgeConfig, FrameMode, TransportConfig};
 use crate::core::connection_manager::{BridgeHandle, ConnectionManager};
 use crate::core::metrics::GlobalMetrics;
 use crate::drivers::create_driver;
@@ -325,6 +325,9 @@ async fn run_bridge(
     let mut last_hint = crate::protocol::ProtocolHint::Unknown;
     let mut failure_count: u32 = 0;
     let mut backoff_ms: u64 = 1_000;
+    // Accumulation buffer for delimiter-based frame modes (Line, NullTerminated).
+    // Cleared whenever the driver reopens so stale partial frames are discarded.
+    let mut frame_buf: Vec<u8> = Vec::new();
 
     'outer: loop {
         // Respect shutdown signal
@@ -353,6 +356,7 @@ async fn run_bridge(
                 info!(bridge = %bridge_name, "Hardware driver opened");
                 failure_count = 0;
                 backoff_ms = 1_000;
+                frame_buf.clear(); // discard any stale partial frame from previous run
             }
             Err(e) => {
                 let wait = driver_backoff(&mut failure_count, &mut backoff_ms);
@@ -417,9 +421,35 @@ async fn run_bridge(
                         }
                     }
 
-                    // Broadcast to all subscribed client tasks.
-                    let data = Bytes::copy_from_slice(&buf[..n]);
-                    conn_mgr.lock().broadcast(data);
+                    // Apply framing then broadcast to all subscribed client tasks.
+                    match cfg.frame_mode {
+                        FrameMode::None => {
+                            let data = Bytes::copy_from_slice(&buf[..n]);
+                            conn_mgr.lock().broadcast(data);
+                        }
+                        FrameMode::LengthPrefix => {
+                            let mut framed = bytes::BytesMut::with_capacity(2 + n);
+                            framed.extend_from_slice(&(n as u16).to_be_bytes());
+                            framed.extend_from_slice(&buf[..n]);
+                            conn_mgr.lock().broadcast(framed.freeze());
+                        }
+                        FrameMode::Line => {
+                            frame_buf.extend_from_slice(&buf[..n]);
+                            while let Some(pos) = frame_buf.iter().position(|&b| b == b'\n') {
+                                let frame = Bytes::copy_from_slice(&frame_buf[..=pos]);
+                                conn_mgr.lock().broadcast(frame);
+                                frame_buf.drain(..=pos);
+                            }
+                        }
+                        FrameMode::NullTerminated => {
+                            frame_buf.extend_from_slice(&buf[..n]);
+                            while let Some(pos) = frame_buf.iter().position(|&b| b == 0x00) {
+                                let frame = Bytes::copy_from_slice(&frame_buf[..=pos]);
+                                conn_mgr.lock().broadcast(frame);
+                                frame_buf.drain(..=pos);
+                            }
+                        }
+                    }
                     trace!(bridge = %bridge_name, bytes = n, "Broadcast sent");
                 }
             }

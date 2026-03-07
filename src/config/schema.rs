@@ -60,6 +60,13 @@ pub struct BridgeConfig {
     /// Auto-restart the bridge on source failure (default: true)
     #[serde(default = "default_true")]
     pub auto_restart: bool,
+
+    /// Frame each driver read before sending to clients.
+    /// Use `length_prefix` for fixed-size sensor reads (I2C, SPI) to prevent
+    /// TCP stream fragmentation from splitting frames across multiple reads.
+    /// Clients must read: 2 bytes (big-endian u16 length) then that many bytes.
+    #[serde(default)]
+    pub frame_mode: FrameMode,
 }
 
 /// Bridge data forwarding mode.
@@ -73,6 +80,37 @@ pub enum BridgeMode {
     Exclusive,
     /// Forward client data to another TCP endpoint (proxy)
     Proxy,
+}
+
+/// How each hardware read is packaged before sending to TCP clients.
+///
+/// Applies to any bridge source (serial, I2C, Bluetooth, etc.).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameMode {
+    /// Raw bytes with no extra framing (default).
+    /// The TCP stream is forwarded as-is; the client is responsible for
+    /// its own framing logic. Best for serial/UART stream protocols.
+    #[default]
+    None,
+
+    /// Prepend each driver read with a 2-byte big-endian length header.
+    /// Wire format: `[u16 length][data]`.
+    /// Client reads 2 bytes → parse length N → read exactly N bytes.
+    /// Best for fixed-size binary sensor reads (I2C, SPI) where TCP
+    /// fragmentation would otherwise split frames.
+    LengthPrefix,
+
+    /// Buffer incoming bytes and emit one frame per newline (`\n`).
+    /// The `\n` is included in the frame sent to clients.
+    /// Best for ASCII line-based protocols: NMEA (GPS), AT commands, SCPI.
+    /// Partial lines are held until the terminator arrives.
+    Line,
+
+    /// Buffer incoming bytes and emit one frame per null byte (`0x00`).
+    /// The `0x00` terminator is included in the frame sent to clients.
+    /// Best for COBS-encoded streams where each packet ends with 0x00.
+    NullTerminated,
 }
 
 /// IO source (hardware side of the bridge).
@@ -640,6 +678,207 @@ token = "secret"
         let m = MetricsConfig::default();
         assert!(m.enabled);
         assert_eq!(m.listen, "0.0.0.0:9105");
+    }
+
+    // ── I2cConfig ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn i2c_config_defaults() {
+        let i = I2cConfig::default();
+        assert_eq!(i.bus, "/dev/i2c-1");
+        assert_eq!(i.address, 0x68);
+        assert_eq!(i.read_len, 6);
+        assert_eq!(i.poll_ms, 100);
+        assert!(i.read_reg.is_none());
+        assert!(i.init_bytes.is_empty());
+    }
+
+    #[test]
+    fn parse_i2c_source_minimal() {
+        let b = minimal_bridge(
+            r#"[source]
+type = "i2c"
+bus = "/dev/i2c-1"
+address = 0x68
+read_len = 14
+poll_ms = 10"#,
+            r#"[transport]
+type = "tcp"
+listen = "[::]:9002""#,
+        );
+        match b.source {
+            SourceConfig::I2c(i) => {
+                assert_eq!(i.bus, "/dev/i2c-1");
+                assert_eq!(i.address, 0x68);
+                assert_eq!(i.read_len, 14);
+                assert_eq!(i.poll_ms, 10);
+                assert!(i.read_reg.is_none());
+                assert!(i.init_bytes.is_empty());
+            }
+            _ => panic!("expected I2c"),
+        }
+    }
+
+    #[test]
+    fn parse_i2c_source_with_read_reg_and_init_bytes() {
+        // MPU-6050 IMU: wake from sleep with [0x6B, 0x00], then read 14 bytes from reg 0x3B
+        let b = minimal_bridge(
+            r#"[source]
+type = "i2c"
+bus = "/dev/i2c-1"
+address = 0x68
+read_len = 14
+poll_ms = 10
+read_reg = 0x3B
+init_bytes = [[0x6B, 0x00]]"#,
+            r#"[transport]
+type = "tcp"
+listen = "[::]:9002""#,
+        );
+        match b.source {
+            SourceConfig::I2c(i) => {
+                assert_eq!(i.read_reg, Some(0x3B));
+                assert_eq!(i.init_bytes, vec![vec![0x6B, 0x00]]);
+            }
+            _ => panic!("expected I2c"),
+        }
+    }
+
+    #[test]
+    fn parse_i2c_source_multiple_init_sequences() {
+        // Device requiring two init writes before first read
+        let b = minimal_bridge(
+            r#"[source]
+type = "i2c"
+bus = "/dev/i2c-1"
+address = 0x77
+read_len = 8
+poll_ms = 50
+read_reg = 0xF7
+init_bytes = [[0xF4, 0x2F], [0xF5, 0xA0]]"#,
+            r#"[transport]
+type = "tcp"
+listen = "[::]:9003""#,
+        );
+        match b.source {
+            SourceConfig::I2c(i) => {
+                assert_eq!(i.address, 0x77);
+                assert_eq!(i.read_reg, Some(0xF7));
+                assert_eq!(i.init_bytes.len(), 2);
+                assert_eq!(i.init_bytes[0], vec![0xF4, 0x2F]);
+                assert_eq!(i.init_bytes[1], vec![0xF5, 0xA0]);
+            }
+            _ => panic!("expected I2c"),
+        }
+    }
+
+    #[test]
+    fn frame_mode_variants_parse() {
+        for (s, expected) in [
+            ("none", FrameMode::None),
+            ("length_prefix", FrameMode::LengthPrefix),
+            ("line", FrameMode::Line),
+            ("null_terminated", FrameMode::NullTerminated),
+        ] {
+            // FrameMode is serde-transparent; wrap in a trivial struct for round-trip.
+            #[derive(serde::Deserialize)]
+            struct W { frame_mode: FrameMode }
+            let w: W = toml::from_str(&format!("frame_mode = \"{}\"", s)).unwrap();
+            assert_eq!(w.frame_mode, expected, "failed for {}", s);
+        }
+    }
+
+    #[test]
+    fn parse_bridge_frame_mode_length_prefix() {
+        let doc = r#"
+name = "imu"
+frame_mode = "length_prefix"
+read_only = true
+
+[source]
+type = "i2c"
+bus = "/dev/i2c-1"
+address = 0x68
+read_len = 14
+poll_ms = 10
+read_reg = 0x3B
+init_bytes = [[0x6B, 0x00]]
+
+[transport]
+type = "tcp"
+listen = "[::]:9002"
+"#;
+        let b: BridgeConfig = toml::from_str(doc).unwrap();
+        assert_eq!(b.frame_mode, FrameMode::LengthPrefix);
+        assert!(b.read_only);
+    }
+
+    #[test]
+    fn parse_bridge_frame_mode_default_is_none() {
+        let b = minimal_bridge(
+            r#"[source]
+type = "pty""#,
+            r#"[transport]
+type = "tcp"
+listen = "[::]:9000""#,
+        );
+        assert_eq!(b.frame_mode, FrameMode::None);
+    }
+
+    #[test]
+    fn parse_bridge_frame_mode_line_on_serial() {
+        let doc = r#"
+name = "gps"
+frame_mode = "line"
+
+[source]
+type = "serial"
+port = "/dev/ttyUSB0"
+baud = 9600
+
+[transport]
+type = "tcp"
+listen = "[::]:9010"
+"#;
+        let b: BridgeConfig = toml::from_str(doc).unwrap();
+        assert_eq!(b.frame_mode, FrameMode::Line);
+    }
+
+    #[test]
+    fn parse_bridge_frame_mode_null_terminated_on_serial() {
+        let doc = r#"
+name = "cobs-sensor"
+frame_mode = "null_terminated"
+
+[source]
+type = "serial"
+port = "/dev/ttyUSB1"
+baud = 115200
+
+[transport]
+type = "tcp"
+listen = "[::]:9011"
+"#;
+        let b: BridgeConfig = toml::from_str(doc).unwrap();
+        assert_eq!(b.frame_mode, FrameMode::NullTerminated);
+    }
+
+    #[test]
+    fn i2c_config_serde_roundtrip() {
+        let original = I2cConfig {
+            bus: "/dev/i2c-2".to_string(),
+            address: 0x1D,
+            read_len: 6,
+            poll_ms: 20,
+            read_reg: Some(0x28),
+            init_bytes: vec![vec![0x20, 0x57]],
+        };
+        let serialised = toml::to_string(&original).unwrap();
+        let parsed: I2cConfig = toml::from_str(&serialised).unwrap();
+        assert_eq!(parsed.bus, original.bus);
+        assert_eq!(parsed.address, original.address);
+        assert_eq!(parsed.read_reg, original.read_reg);
+        assert_eq!(parsed.init_bytes, original.init_bytes);
     }
 
     // ── Serialise AppConfig round-trip ────────────────────────────────────

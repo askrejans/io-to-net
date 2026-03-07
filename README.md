@@ -208,6 +208,180 @@ listen = "[::]:9000"
 
 ---
 
+# Bridge Architecture
+
+Each bridge runs three independent async tasks:
+
+```
+┌─ transport task ─────────────────────────────────────────────┐
+│  Accepts TCP connections. Always running. Clients can connect │
+│  even while the hardware is offline or being retried.        │
+└─────────────────────────────────────────────────────────────┘
+         │ ClientHandle (tx/rx channels)
+         ▼
+┌─ client intake task ─────────────────────────────────────────┐
+│  Receives new clients from the transport task and registers   │
+│  them in the ConnectionManager. Manages per-client fan-out.  │
+└─────────────────────────────────────────────────────────────┘
+         │ broadcast channel
+         ▼
+┌─ driver loop ────────────────────────────────────────────────┐
+│  Opens hardware, reads data, broadcasts to all clients.       │
+│  Retries with exponential backoff on failure. Client          │
+│  connections survive driver restarts intact.                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Clients always connectable**: the TCP port is bound and ready before the hardware driver opens. Clients connecting while the hardware is offline simply receive no data until the driver comes up — they do not need to reconnect.
+
+**Driver restart transparency**: when the hardware fails and restarts (e.g. sensor disconnected then reconnected), existing TCP clients stay connected and resume receiving data automatically.
+
+---
+
+# Frame Mode
+
+By default, io-to-net forwards the raw byte stream from the hardware directly to TCP clients (`frame_mode = "none"`). This is correct for UART/serial streams where the client handles its own framing. For sources that produce discrete messages (I2C sensor reads, NMEA sentences, COBS packets), you can enable automatic framing to ensure clients always receive complete, aligned frames regardless of how TCP delivers the bytes.
+
+`frame_mode` is set at the bridge level and works with any source type:
+
+| Value | Description | Best for |
+|-------|-------------|----------|
+| `none` | Raw stream, no framing (default) | serial, PTY, Unix socket |
+| `length_prefix` | `[u16 big-endian length][data]` | I2C, SPI — fixed-size binary reads |
+| `line` | Buffer until `\n`, emit one frame per line (including `\n`) | NMEA (GPS), AT commands, SCPI |
+| `null_terminated` | Buffer until `0x00`, emit one frame per packet (including `0x00`) | COBS-encoded streams |
+
+**Client read pattern per mode:**
+
+```
+none            →  stream.read(&mut buf)   # may get partial data — client must frame
+length_prefix   →  stream.read_exact(&mut [0u8; 2])  → parse u16 N
+                   stream.read_exact(&mut buf[..N])   # always N complete bytes
+line            →  BufReader::lines()  or  stream.read_until(b'\n', &mut buf)
+null_terminated →  stream.read_until(0x00, &mut buf)
+```
+
+**Serial NMEA GPS example** (`line` mode):
+
+```toml
+[[bridges]]
+name = "gps"
+frame_mode = "line"    # each NMEA sentence ($GPGGA,...\n) arrives as one complete frame
+
+[bridges.source]
+type = "serial"
+port = "/dev/ttyUSB0"
+baud = 9600
+
+[bridges.transport]
+type = "tcp"
+listen = "[::]:9001"
+```
+
+**Serial COBS sensor example** (`null_terminated` mode):
+
+```toml
+[[bridges]]
+name = "sensor"
+frame_mode = "null_terminated"   # each COBS packet (ends with 0x00) arrives complete
+
+[bridges.source]
+type = "serial"
+port = "/dev/ttyUSB1"
+baud = 115200
+
+[bridges.transport]
+type = "tcp"
+listen = "[::]:9002"
+```
+
+---
+
+# I2C Sensor Configuration
+
+Most I2C sensors require two things that are often missed:
+
+1. **Wake from sleep** — many sensors (e.g. MPU-6050) power on in sleep mode. An init write is needed to start them.
+2. **Register pointer** — before reading sensor data, the device's internal address pointer must be set to the correct register. Without this, reads return garbage or data from the wrong register.
+
+All three are configured per-bridge:
+
+| Field | Scope | Type | Purpose |
+|-------|-------|------|---------|
+| `read_reg` | `[bridges.source]` | `integer` (optional) | Register address written before each read |
+| `init_bytes` | `[bridges.source]` | `[[integer]]` (optional) | Write transactions sent once on open |
+| `frame_mode` | `[[bridges]]` | `"none"` \| `"length_prefix"` | How each read is wrapped before sending to clients |
+
+**`frame_mode = "length_prefix"`** is strongly recommended for I2C/SPI bridges. TCP is a stream protocol — without framing, a client `read()` call may return a partial frame. With `length_prefix`, each driver read is sent as `[2-byte big-endian length][data]`, so the client always reads a complete frame:
+
+```
+client reads: 2 bytes → u16 length N
+client reads: N bytes → complete sensor frame
+```
+
+**MPU-6050 IMU example** (accelerometer + gyroscope, 14 bytes at 100 Hz):
+
+```toml
+[[bridges]]
+name = "imu"
+read_only = true
+auto_restart = true
+frame_mode = "length_prefix"   # each 14-byte read arrives as [0x00, 0x0E, ...14 bytes]
+
+[bridges.source]
+type = "i2c"
+bus = "/dev/i2c-1"
+address = 0x68          # MPU-6050 default I2C address (AD0 low)
+read_len = 14           # ACCEL_XYZ (6) + TEMP (2) + GYRO_XYZ (6)
+poll_ms = 10            # 100 Hz
+read_reg = 0x3B         # ACCEL_XOUT_H — start of data registers
+init_bytes = [[0x6B, 0x00]]  # PWR_MGMT_1 = 0: wake from sleep
+
+[bridges.transport]
+type = "tcp"
+listen = "[::]:9002"
+```
+
+**BMP280 pressure sensor example** (8 raw bytes at 20 Hz):
+
+```toml
+[[bridges]]
+name = "baro"
+read_only = true
+auto_restart = true
+frame_mode = "length_prefix"
+
+[bridges.source]
+type = "i2c"
+bus = "/dev/i2c-1"
+address = 0x77
+read_len = 8
+poll_ms = 50
+read_reg = 0xF7
+init_bytes = [
+  [0xF4, 0x2F],   # ctrl_meas: temp×1, press×1, normal mode
+  [0xF5, 0xA0],   # config: standby 1s, filter off
+]
+
+[bridges.transport]
+type = "tcp"
+listen = "[::]:9003"
+```
+
+**Finding register addresses**: consult the sensor datasheet. Look for the "data registers" or "output registers" table. The `read_reg` value is the address of the first byte you want to read. Common values:
+
+| Sensor | Address | read_reg | read_len | init_bytes |
+|--------|---------|----------|----------|------------|
+| MPU-6050 accel+gyro | 0x68 | 0x3B | 14 | `[[0x6B, 0x00]]` |
+| MPU-6050 accel only | 0x68 | 0x3B | 6 | `[[0x6B, 0x00]]` |
+| LSM6DS3 accel+gyro | 0x6A | 0x28 | 12 | `[[0x10, 0x60], [0x11, 0x60]]` |
+| BMP280 raw data | 0x77 | 0xF7 | 8 | `[[0xF4, 0x2F], [0xF5, 0xA0]]` |
+| ADS1115 | 0x48 | 0x00 | 2 | _(none required)_ |
+
+I2C drivers run blocking operations on a dedicated thread pool (`spawn_blocking`) so the async runtime is never stalled.
+
+---
+
 # Device Discovery
 
 ```bash
