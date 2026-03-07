@@ -288,6 +288,7 @@ async fn run_bridge(
     let mut detector = ProtocolDetector::new();
     let mut failure_count = 0;
     let mut backoff_ms = 500;
+    const FAILURE_LIMIT: u32 = 8;
 
     loop {
         // Try to open hardware driver, retry with backoff if fails
@@ -296,8 +297,15 @@ async fn run_bridge(
             Err(e) => {
                 error!(bridge = %cfg.name, error = %e, "Driver creation failed");
                 failure_count += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(10000);
+                if failure_count >= FAILURE_LIMIT {
+                    warn!(bridge = %cfg.name, failures = failure_count, "Too many consecutive driver failures, increasing backoff");
+                    tokio::time::sleep(std::time::Duration::from_millis(30000)).await;
+                    failure_count = 0;
+                    backoff_ms = 500;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(10000);
+                }
                 continue;
             }
         };
@@ -309,8 +317,15 @@ async fn run_bridge(
             Err(e) => {
                 error!(bridge = %cfg.name, error = %e, "Driver open failed");
                 failure_count += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(10000);
+                if failure_count >= FAILURE_LIMIT {
+                    warn!(bridge = %cfg.name, failures = failure_count, "Too many consecutive driver failures, increasing backoff");
+                    tokio::time::sleep(std::time::Duration::from_millis(30000)).await;
+                    failure_count = 0;
+                    backoff_ms = 500;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(10000);
+                }
                 continue;
             }
         }
@@ -339,8 +354,15 @@ async fn run_bridge(
                         Err(e) => {
                             error!(bridge = %cfg.name, error = %e, "Driver read error");
                             failure_count += 1;
-                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                            backoff_ms = (backoff_ms * 2).min(10000);
+                            if failure_count >= FAILURE_LIMIT {
+                                warn!(bridge = %cfg.name, failures = failure_count, "Too many consecutive driver failures, increasing backoff");
+                                tokio::time::sleep(std::time::Duration::from_millis(30000)).await;
+                                failure_count = 0;
+                                backoff_ms = 500;
+                            } else {
+                                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                                backoff_ms = (backoff_ms * 2).min(10000);
+                            }
                             break; // Restart driver
                         }
                         Ok(0) => {}  // timeout, no data
