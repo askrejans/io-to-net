@@ -225,7 +225,7 @@ async fn run_bridge(
     // Channel: new clients arrive from the transport
     let (new_client_tx, mut new_client_rx) = mpsc::channel::<ClientHandle>(32);
     // Channel: device write requests from clients
-    let (device_write_tx, mut device_write_rx) = mpsc::channel::<Bytes>(1024);
+    let (_device_write_tx, _device_write_rx) = mpsc::channel::<Bytes>(1024);
 
     let mut conn_mgr = ConnectionManager::new(
         cfg.name.clone(),
@@ -234,7 +234,7 @@ async fn run_bridge(
     );
 
     let max_clients = cfg.max_clients;
-    let read_only = cfg.read_only;
+    let _read_only = cfg.read_only;
 
     // Spawn transport listener in a separate task, propagate bind errors immediately
     let transport_cfg = cfg.transport.clone();
@@ -284,8 +284,8 @@ async fn run_bridge(
     // Hold sd_tx alive so listener gets shutdown when we drop it on bridge end
     let _ = sd_tx; // keep alive; will drop at task end
 
-    let mut buf = [0u8; 4096];
-    let mut detector = ProtocolDetector::new();
+    let _buf = [0u8; 4096];
+    let _detector = ProtocolDetector::new();
     let mut failure_count = 0;
     let mut backoff_ms = 500;
     const FAILURE_LIMIT: u32 = 8;
