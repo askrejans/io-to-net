@@ -23,6 +23,7 @@ pub trait IoDriver: Send + Sync {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
 
     /// Write raw bytes to the hardware interface.
+    #[allow(dead_code)]
     async fn write(&mut self, data: &[u8]) -> Result<usize>;
 
     /// Close the hardware interface cleanly.

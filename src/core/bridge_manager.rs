@@ -220,9 +220,6 @@ async fn run_bridge(
 ) -> Result<()> {
     use crate::transports::ClientHandle;
 
-    let mut driver = create_driver(&cfg.source)?;
-    driver.open().await?;
-
     // Channel: new clients arrive from the transport
     let (new_client_tx, mut new_client_rx) = mpsc::channel::<ClientHandle>(32);
     // Channel: device write requests from clients
@@ -298,17 +295,19 @@ async fn run_bridge(
             Err(e) => {
                 error!(bridge = %cfg.name, error = %e, "Driver creation failed");
                 failure_count += 1;
-                if failure_count >= FAILURE_LIMIT {
+                let wait_ms = if failure_count >= FAILURE_LIMIT {
                     warn!(bridge = %cfg.name, failures = failure_count, "Too many consecutive driver failures, increasing backoff");
-                    tokio::time::sleep(std::time::Duration::from_millis(30000)).await;
                     failure_count = 0;
                     backoff_ms = 500;
+                    30_000
                 } else {
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(10000);
-                }
-                // Instead of continue, run client loop with no hardware
-                run_client_loop(&mut conn_mgr, &mut new_client_rx, None, &mut detector, &mut buf).await;
+                    let w = backoff_ms;
+                    backoff_ms = (backoff_ms * 2).min(10_000);
+                    w
+                };
+                // Accept clients while waiting to retry the driver.
+                run_client_loop(&mut conn_mgr, &mut new_client_rx, None, &mut detector, &mut buf,
+                    Some(std::time::Duration::from_millis(wait_ms)), metrics.clone(), &cfg.name).await;
                 continue;
             }
         };
@@ -320,23 +319,25 @@ async fn run_bridge(
             Err(e) => {
                 error!(bridge = %cfg.name, error = %e, "Driver open failed");
                 failure_count += 1;
-                if failure_count >= FAILURE_LIMIT {
+                let wait_ms = if failure_count >= FAILURE_LIMIT {
                     warn!(bridge = %cfg.name, failures = failure_count, "Too many consecutive driver failures, increasing backoff");
-                    tokio::time::sleep(std::time::Duration::from_millis(30000)).await;
                     failure_count = 0;
                     backoff_ms = 500;
+                    30_000
                 } else {
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(10000);
-                }
-                // Instead of continue, run client loop with no hardware
-                run_client_loop(&mut conn_mgr, &mut new_client_rx, None, &mut detector, &mut buf).await;
+                    let w = backoff_ms;
+                    backoff_ms = (backoff_ms * 2).min(10_000);
+                    w
+                };
+                // Accept clients while waiting to retry the driver.
+                run_client_loop(&mut conn_mgr, &mut new_client_rx, None, &mut detector, &mut buf,
+                    Some(std::time::Duration::from_millis(wait_ms)), metrics.clone(), &cfg.name).await;
                 continue;
             }
         }
 
         // Main bridge loop: process clients and hardware reads
-        run_client_loop(&mut conn_mgr, &mut new_client_rx, Some(driver.as_mut()), &mut detector, &mut buf).await;
+        run_client_loop(&mut conn_mgr, &mut new_client_rx, Some(driver.as_mut()), &mut detector, &mut buf, None, metrics.clone(), &cfg.name).await;
     }
 
 }
@@ -347,7 +348,17 @@ async fn run_client_loop(
     mut driver: Option<&mut dyn crate::drivers::IoDriver>,
     detector: &mut crate::protocol::ProtocolDetector,
     buf: &mut [u8; 4096],
+    no_driver_timeout: Option<std::time::Duration>,
+    metrics: Arc<RwLock<GlobalMetrics>>,
+    bridge_name: &str,
 ) {
+    // When there is no hardware driver, run until the retry deadline then break
+    // so the outer loop can attempt to open the driver again.
+    let deadline = no_driver_timeout.map(|d| tokio::time::Instant::now() + d);
+
+    // Track the last hint we pushed to metrics so we only lock on changes.
+    let mut last_hint = crate::protocol::ProtocolHint::Unknown;
+
     loop {
         tokio::select! {
             // New client connected via transport
@@ -362,28 +373,44 @@ async fn run_client_loop(
                         dw_tx,
                         false,
                     );
-                    if driver.is_none() {
-                        // Optionally send error/status to client here
-                    }
                 }
             }
-            // Data from driver (hardware → broadcast to clients)
-            // Only if driver is available
-            read_result = async {
+            // Data from driver (hardware → broadcast to clients), or backoff sleep
+            // when no driver is present.
+            result = async {
                 if let Some(d) = driver.as_mut() {
-                    d.read(buf).await
+                    match d.read(buf).await {
+                        Err(_) => Err(true),  // hardware error → break
+                        Ok(n)  => Ok(n),
+                    }
+                } else if let Some(dl) = deadline {
+                    tokio::time::sleep_until(dl).await;
+                    Err(false)  // backoff elapsed → break to retry driver
                 } else {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    Err(crate::error::IoToNetError::Driver("No hardware driver available".to_string()))
+                    std::future::pending::<crate::error::Result<usize>>().await
+                        .map_err(|_| true)
                 }
             } => {
-                match read_result {
-                    Err(_) => { break; }
-                    Ok(0) => {}  // timeout, no data
-                    Ok(n) => {
+                match result {
+                    Err(_)  => break,
+                    Ok(0)   => {}  // read timeout / no data
+                    Ok(n)   => {
                         detector.feed(&buf[..n]);
-                        let hint = detector.hint();
+                        let hint = detector.hint().clone();
                         trace!(protocol_hint = ?hint, "Protocol detection updated");
+
+                        // Push updated protocol stats to metrics when the hint changes.
+                        if hint != last_hint {
+                            last_hint = hint.clone();
+                            let stats = detector.stats();
+                            let mut m = metrics.write();
+                            if let Some(bm) = m.bridges.get_mut(bridge_name) {
+                                bm.protocol_hint = hint;
+                                bm.message_rate = stats.message_rate;
+                                bm.avg_frame_size = stats.avg_frame_size;
+                            }
+                        }
+
                         let data = bytes::Bytes::copy_from_slice(&buf[..n]);
                         conn_mgr.broadcast(data);
                     }
