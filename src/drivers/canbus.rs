@@ -9,10 +9,6 @@ use crate::error::{IoToNetError, Result};
 
 use super::IoDriver;
 
-#[cfg(target_os = "linux")]
-use socketcan::Frame;
-#[cfg(target_os = "linux")]
-use socketcan::embedded_can::Frame;
 /// CAN bus driver using socketcan (Linux only).
 /// Each CAN frame is serialised as: [ID:4 bytes LE][DLC:1 byte][data:0-8 bytes]
 pub struct CanbusDriver {
@@ -56,6 +52,7 @@ impl IoDriver for CanbusDriver {
                     match socket.read_frame() {
                         Ok(frame) => {
                             use socketcan::Frame;
+                            use socketcan::EmbeddedFrame;
                             // Apply optional ID filter
                             if let Some(mask) = filter {
                                 if frame.raw_id() & mask != frame.raw_id() & mask {
