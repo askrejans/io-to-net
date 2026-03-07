@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tracing::trace;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc};
@@ -307,7 +308,7 @@ async fn run_bridge(
                     backoff_ms = (backoff_ms * 2).min(10000);
                 }
                 // Instead of continue, run client loop with no hardware
-                run_client_loop(&mut conn_mgr, &mut new_client_rx, None).await;
+                run_client_loop(&mut conn_mgr, &mut new_client_rx, None, &mut detector, &mut buf).await;
                 continue;
             }
         };
@@ -329,7 +330,7 @@ async fn run_bridge(
                     backoff_ms = (backoff_ms * 2).min(10000);
                 }
                 // Instead of continue, run client loop with no hardware
-                run_client_loop(&mut conn_mgr, &mut new_client_rx, None).await;
+                run_client_loop(&mut conn_mgr, &mut new_client_rx, None, &mut detector, &mut buf).await;
                 continue;
             }
         }
