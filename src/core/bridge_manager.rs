@@ -309,7 +309,9 @@ async fn run_bridge(
                 match read_result {
                     Err(e) => {
                         error!(bridge = %cfg.name, error = %e, "Driver read error");
-                        return Err(e);
+                        // Instead of exiting, log and continue (optionally add backoff)
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
                     }
                     Ok(0) => {}  // timeout, no data
                     Ok(n) => {
