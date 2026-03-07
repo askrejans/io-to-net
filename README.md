@@ -2,9 +2,11 @@
 
 # Project Status
 
-Active development. Not expected to work yet. Interfaces and configuration format may change before 1.0.
+Active development. Not expected to work yet. Tested with I2C sensors in read only mode. These and serial ports should work. Framing works and essential for I2C.
 
 Contributions and feedback welcome.
+
+
 -------
 **io-to-net** is an **Edge Hardware Networking Layer** that exposes local hardware interfaces over TCP/IP.
 
