@@ -284,8 +284,8 @@ async fn run_bridge(
     // Hold sd_tx alive so listener gets shutdown when we drop it on bridge end
     let _ = sd_tx; // keep alive; will drop at task end
 
-    let _buf = [0u8; 4096];
-    let _detector = ProtocolDetector::new();
+    let mut buf = [0u8; 4096];
+    let mut detector = ProtocolDetector::new();
     let mut failure_count = 0;
     let mut backoff_ms = 500;
     const FAILURE_LIMIT: u32 = 8;
@@ -335,7 +335,7 @@ async fn run_bridge(
         }
 
         // Main bridge loop: process clients and hardware reads
-        run_client_loop(&mut conn_mgr, &mut new_client_rx, Some(driver.as_mut())).await;
+        run_client_loop(&mut conn_mgr, &mut new_client_rx, Some(driver.as_mut()), &mut detector, &mut buf).await;
     }
 
 }
@@ -344,8 +344,9 @@ async fn run_client_loop(
     conn_mgr: &mut crate::core::connection_manager::ConnectionManager,
     new_client_rx: &mut tokio::sync::mpsc::Receiver<crate::transports::ClientHandle>,
     mut driver: Option<&mut dyn crate::drivers::IoDriver>,
+    detector: &mut crate::protocol::ProtocolDetector,
+    buf: &mut [u8; 4096],
 ) {
-    let mut buf = [0u8; 4096];
     loop {
         tokio::select! {
             // New client connected via transport
@@ -369,7 +370,7 @@ async fn run_client_loop(
             // Only if driver is available
             read_result = async {
                 if let Some(d) = driver.as_mut() {
-                    d.read(&mut buf).await
+                    d.read(buf).await
                 } else {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     Err(crate::error::IoToNetError::Driver("No hardware driver available".to_string()))
@@ -379,6 +380,9 @@ async fn run_client_loop(
                     Err(_) => { break; }
                     Ok(0) => {}  // timeout, no data
                     Ok(n) => {
+                        detector.feed(&buf[..n]);
+                        let hint = detector.hint();
+                        trace!(protocol_hint = ?hint, "Protocol detection updated");
                         let data = bytes::Bytes::copy_from_slice(&buf[..n]);
                         conn_mgr.broadcast(data);
                     }
