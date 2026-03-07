@@ -222,8 +222,8 @@ async fn run_bridge(
 
     // Channel: new clients arrive from the transport
     let (new_client_tx, mut new_client_rx) = mpsc::channel::<ClientHandle>(32);
-    // Channel: device write requests from clients
-    let (_device_write_tx, _device_write_rx) = mpsc::channel::<Bytes>(1024);
+    // Shared channel: all connected clients send device writes here
+    let (device_write_tx, mut device_write_rx) = mpsc::channel::<Bytes>(1024);
 
     let mut conn_mgr = ConnectionManager::new(
         cfg.name.clone(),
@@ -232,7 +232,7 @@ async fn run_bridge(
     );
 
     let max_clients = cfg.max_clients;
-    let _read_only = cfg.read_only;
+    let read_only = cfg.read_only;
 
     // Spawn transport listener in a separate task, propagate bind errors immediately
     let transport_cfg = cfg.transport.clone();
@@ -307,7 +307,8 @@ async fn run_bridge(
                 };
                 // Accept clients while waiting to retry the driver.
                 run_client_loop(&mut conn_mgr, &mut new_client_rx, None, &mut detector, &mut buf,
-                    Some(std::time::Duration::from_millis(wait_ms)), metrics.clone(), &cfg.name).await;
+                    Some(std::time::Duration::from_millis(wait_ms)), metrics.clone(), &cfg.name,
+                    &device_write_tx, &mut device_write_rx, read_only).await;
                 continue;
             }
         };
@@ -331,13 +332,15 @@ async fn run_bridge(
                 };
                 // Accept clients while waiting to retry the driver.
                 run_client_loop(&mut conn_mgr, &mut new_client_rx, None, &mut detector, &mut buf,
-                    Some(std::time::Duration::from_millis(wait_ms)), metrics.clone(), &cfg.name).await;
+                    Some(std::time::Duration::from_millis(wait_ms)), metrics.clone(), &cfg.name,
+                    &device_write_tx, &mut device_write_rx, read_only).await;
                 continue;
             }
         }
 
         // Main bridge loop: process clients and hardware reads
-        run_client_loop(&mut conn_mgr, &mut new_client_rx, Some(driver.as_mut()), &mut detector, &mut buf, None, metrics.clone(), &cfg.name).await;
+        run_client_loop(&mut conn_mgr, &mut new_client_rx, Some(driver.as_mut()), &mut detector, &mut buf,
+            None, metrics.clone(), &cfg.name, &device_write_tx, &mut device_write_rx, read_only).await;
     }
 
 }
@@ -351,6 +354,9 @@ async fn run_client_loop(
     no_driver_timeout: Option<std::time::Duration>,
     metrics: Arc<RwLock<GlobalMetrics>>,
     bridge_name: &str,
+    device_write_tx: &tokio::sync::mpsc::Sender<bytes::Bytes>,
+    device_write_rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    read_only: bool,
 ) {
     // When there is no hardware driver, run until the retry deadline then break
     // so the outer loop can attempt to open the driver again.
@@ -360,18 +366,31 @@ async fn run_client_loop(
     let mut last_hint = crate::protocol::ProtocolHint::Unknown;
 
     loop {
+        // Drain any pending client→device writes and forward to hardware (best-effort).
+        // Done before the select so driver isn't borrowed in two places simultaneously.
+        if !read_only {
+            while let Ok(data) = device_write_rx.try_recv() {
+                if let Some(d) = driver.as_mut() {
+                    let _ = d.write(&data).await;
+                }
+            }
+        } else {
+            // Drain and discard so the channel never fills up.
+            while device_write_rx.try_recv().is_ok() {}
+        }
+
         tokio::select! {
             // New client connected via transport
             client = new_client_rx.recv() => {
                 if let Some(client) = client {
-                    let dw_tx = tokio::sync::mpsc::channel::<bytes::Bytes>(1024).0;
+                    // Clone the shared sender so client writes go to the shared channel.
                     conn_mgr.add_client(
                         client.id,
                         client.addr,
                         client.tx,
                         client.rx,
-                        dw_tx,
-                        false,
+                        device_write_tx.clone(),
+                        read_only,
                     );
                 }
             }
