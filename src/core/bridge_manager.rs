@@ -306,6 +306,8 @@ async fn run_bridge(
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     backoff_ms = (backoff_ms * 2).min(10000);
                 }
+                // Instead of continue, run client loop with no hardware
+                run_client_loop(&mut conn_mgr, &mut new_client_rx, None);
                 continue;
             }
         };
@@ -326,74 +328,59 @@ async fn run_bridge(
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     backoff_ms = (backoff_ms * 2).min(10000);
                 }
+                // Instead of continue, run client loop with no hardware
+                run_client_loop(&mut conn_mgr, &mut new_client_rx, None);
                 continue;
             }
         }
 
         // Main bridge loop: process clients and hardware reads
-        loop {
-            tokio::select! {
-                // New client connected via transport
-                client = new_client_rx.recv() => {
-                    if let Some(client) = client {
-                        let dw_tx = device_write_tx.clone();
-                        conn_mgr.add_client(
-                            client.id,
-                            client.addr,
-                            client.tx,
-                            client.rx,
-                            dw_tx,
-                            read_only,
-                        );
+        run_client_loop(&mut conn_mgr, &mut new_client_rx, Some(&mut driver));
+    }
+
+}
+
+fn run_client_loop(
+    conn_mgr: &mut crate::core::connection_manager::ConnectionManager,
+    new_client_rx: &mut tokio::sync::mpsc::Receiver<crate::transports::ClientHandle>,
+    driver: Option<&mut dyn crate::drivers::IoDriver>,
+) {
+    let mut buf = [0u8; 4096];
+    loop {
+        tokio::select! {
+            // New client connected via transport
+            client = new_client_rx.recv() => {
+                if let Some(client) = client {
+                    let dw_tx = tokio::sync::mpsc::channel::<bytes::Bytes>(1024).0;
+                    conn_mgr.add_client(
+                        client.id,
+                        client.addr,
+                        client.tx,
+                        client.rx,
+                        dw_tx,
+                        false,
+                    );
+                    if driver.is_none() {
+                        // Optionally send error/status to client here
                     }
                 }
-
-                // Data from driver (hardware → broadcast to clients)
-                read_result = driver.read(&mut buf) => {
-                    match read_result {
-                        Err(e) => {
-                            error!(bridge = %cfg.name, error = %e, "Driver read error");
-                            failure_count += 1;
-                            if failure_count >= FAILURE_LIMIT {
-                                warn!(bridge = %cfg.name, failures = failure_count, "Too many consecutive driver failures, increasing backoff");
-                                tokio::time::sleep(std::time::Duration::from_millis(30000)).await;
-                                failure_count = 0;
-                                backoff_ms = 500;
-                            } else {
-                                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                                backoff_ms = (backoff_ms * 2).min(10000);
-                            }
-                            break; // Restart driver
-                        }
-                        Ok(0) => {}  // timeout, no data
-                        Ok(n) => {
-                            let data = Bytes::copy_from_slice(&buf[..n]);
-                            // Side-channel protocol observer — never modifies data.
-                            detector.feed(&buf[..n]);
-                            // Publish updated hint to metrics.
-                            {
-                                let stats = detector.stats();
-                                let mut m = metrics.write();
-                                if let Some(bm) = m.bridges.get_mut(&cfg.name) {
-                                    bm.add_rx(n as u64);
-                                    bm.protocol_hint = detector.hint().clone();
-                                    bm.message_rate = stats.message_rate;
-                                    bm.avg_frame_size = stats.avg_frame_size;
-                                }
-                            }
-                            conn_mgr.broadcast(data);
-                        }
-                    }
+            }
+            // Data from driver (hardware → broadcast to clients)
+            // Only if driver is available
+            read_result = async {
+                if let Some(d) = driver {
+                    d.read(&mut buf).await
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    Err(crate::error::IoToNetError::Driver("No hardware driver available".to_string()))
                 }
-
-                // Data from client (client → hardware device)
-                write_data = device_write_rx.recv() => {
-                    if let Some(data) = write_data {
-                        if !read_only {
-                            if let Err(e) = driver.write(&data).await {
-                                warn!(bridge = %cfg.name, error = %e, "Driver write error");
-                            }
-                        }
+            } => {
+                match read_result {
+                    Err(_) => { break; }
+                    Ok(0) => {}  // timeout, no data
+                    Ok(n) => {
+                        let data = bytes::Bytes::copy_from_slice(&buf[..n]);
+                        conn_mgr.broadcast(data);
                     }
                 }
             }
