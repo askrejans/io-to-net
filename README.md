@@ -1,5 +1,11 @@
 # io-to-net
 
+# Project Status
+
+Active development. Not expected to work yet. Interfaces and configuration format may change before 1.0.
+
+Contributions and feedback welcome.
+-------
 **io-to-net** is an **Edge Hardware Networking Layer** that exposes local hardware interfaces over TCP/IP.
 
 It allows devices connected to a machine (serial, I²C, GPIO, Bluetooth, CAN, etc.) to be accessed remotely as if they were locally connected.
@@ -369,14 +375,6 @@ GNU General Public License v3. See [LICENCE](LICENCE).
 | speeduino-to-mqtt | ECU telemetry → MQTT |
 | gps-to-mqtt | GPS stream → MQTT |
 | sensors-to-mqtt | sensor data → MQTT |
-
----
-
-# Project Status
-
-Active development. Interfaces and configuration format may change before 1.0.
-
-Contributions and feedback welcome.
 
 ---
 
