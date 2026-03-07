@@ -335,7 +335,7 @@ async fn run_bridge(
         }
 
         // Main bridge loop: process clients and hardware reads
-        run_client_loop(&mut conn_mgr, &mut new_client_rx, driver.as_mut().map(|d| &mut **d)).await;
+        run_client_loop(&mut conn_mgr, &mut new_client_rx, driver.as_mut()).await;
     }
 
 }
