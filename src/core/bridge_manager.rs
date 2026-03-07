@@ -1,11 +1,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
+
+/// Initial retry delay.
+const BACKOFF_BASE_SECS: u64 = 5;
+/// Maximum retry delay cap.
+const BACKOFF_MAX_SECS: u64 = 300;
+/// Stop retrying after this many consecutive failures.
+const MAX_CONSECUTIVE_FAILURES: u32 = 8;
+/// A run is considered healthy (resets backoff) if it lasted at least this long.
+const HEALTHY_RUN_SECS: u64 = 30;
 
 use crate::config::{AppConfig, BridgeConfig, TransportConfig};
 use crate::core::connection_manager::{BridgeHandle, ConnectionManager};
@@ -91,6 +100,9 @@ impl BridgeManager {
 
         // Outer loop: restart bridge on failure if auto_restart = true
         tokio::spawn(async move {
+            let mut consecutive_failures: u32 = 0;
+            let mut backoff_secs = BACKOFF_BASE_SECS;
+
             loop {
                 info!(bridge = %name, "Bridge starting");
                 {
@@ -100,6 +112,7 @@ impl BridgeManager {
                     }
                 }
 
+                let run_started = Instant::now();
                 let result = run_bridge(
                     bridge_cfg.clone(),
                     metrics_clone.clone(),
@@ -107,6 +120,7 @@ impl BridgeManager {
                     shutdown_tx.subscribe(),
                 )
                 .await;
+                let run_duration = run_started.elapsed();
 
                 {
                     let mut m = metrics_clone.write();
@@ -127,13 +141,58 @@ impl BridgeManager {
                     break;
                 }
 
-                // Wait for restart signal or delay before retry
-                tokio::select! {
-                    _ = restart_rx.recv() => {
-                        info!(bridge = %name, "Bridge restart requested");
+                if result.is_err() {
+                    if run_duration.as_secs() >= HEALTHY_RUN_SECS {
+                        // Was healthy for a while before failing — reset backoff.
+                        consecutive_failures = 0;
+                        backoff_secs = BACKOFF_BASE_SECS;
+                    } else {
+                        consecutive_failures += 1;
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                        warn!(bridge = %name, "Bridge restarting after failure");
+
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        error!(
+                            bridge = %name,
+                            attempts = consecutive_failures,
+                            "Bridge disabled for this session after too many consecutive failures"
+                        );
+                        let mut m = metrics_clone.write();
+                        if let Some(bm) = m.bridges.get_mut(&name) {
+                            bm.set_offline();
+                        }
+                        break;
+                    }
+
+                    warn!(
+                        bridge = %name,
+                        attempt = consecutive_failures,
+                        delay_secs = backoff_secs,
+                        "Bridge restarting after failure"
+                    );
+
+                    // Wait for restart signal or backoff delay
+                    tokio::select! {
+                        _ = restart_rx.recv() => {
+                            info!(bridge = %name, "Bridge restart requested — resetting backoff");
+                            consecutive_failures = 0;
+                            backoff_secs = BACKOFF_BASE_SECS;
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                    }
+
+                    // Exponential backoff, capped at max
+                    backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
+                } else {
+                    // Clean exit (e.g. shutdown signal) — reset state and wait for restart signal
+                    consecutive_failures = 0;
+                    backoff_secs = BACKOFF_BASE_SECS;
+                    tokio::select! {
+                        _ = restart_rx.recv() => {
+                            info!(bridge = %name, "Bridge restart requested");
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(BACKOFF_BASE_SECS)) => {
+                            warn!(bridge = %name, "Bridge restarting");
+                        }
                     }
                 }
             }

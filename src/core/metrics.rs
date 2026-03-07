@@ -27,6 +27,8 @@ pub struct BridgeMetrics {
     #[serde(skip)]
     rate_last_snapshot: Instant,
     pub running: bool,
+    /// Bridge has been permanently disabled for this session after too many failures.
+    pub offline: bool,
     /// Best-effort protocol classification from passive observation.
     pub protocol_hint: ProtocolHint,
     /// Detected message/frame rate (messages per second).
@@ -52,6 +54,7 @@ impl BridgeMetrics {
             rate_window_tx: 0,
             rate_last_snapshot: Instant::now(),
             running: false,
+            offline: false,
             protocol_hint: ProtocolHint::Unknown,
             message_rate: 0.0,
             avg_frame_size: 0.0,
@@ -71,6 +74,11 @@ impl BridgeMetrics {
 
     pub fn increment_errors(&mut self) {
         self.errors += 1;
+    }
+
+    pub fn set_offline(&mut self) {
+        self.offline = true;
+        self.running = false;
     }
 
     /// Update rate calculations — call this periodically (~1s interval).
