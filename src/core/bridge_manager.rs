@@ -2,11 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::trace;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Initial retry delay.
 const BACKOFF_BASE_SECS: u64 = 5;
@@ -211,232 +210,225 @@ impl BridgeManager {
     }
 }
 
+/// Inner driver retry backoff: increments failure count, returns wait duration in ms.
+fn driver_backoff(failure_count: &mut u32, backoff_ms: &mut u64) -> u64 {
+    *failure_count += 1;
+    if *failure_count >= MAX_CONSECUTIVE_FAILURES {
+        *failure_count = 0;
+        *backoff_ms = 1_000;
+        30_000
+    } else {
+        let w = *backoff_ms;
+        *backoff_ms = (*backoff_ms * 2).min(30_000);
+        w
+    }
+}
+
 /// Core bridge task: drives the IO source and forwards data to all clients.
+///
+/// The transport (client accept), client intake, and hardware driver are fully
+/// independent. Clients can always connect regardless of driver state, and
+/// existing connections survive driver restarts.
 async fn run_bridge(
     cfg: BridgeConfig,
     metrics: Arc<RwLock<GlobalMetrics>>,
     log_buffer: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
-    shutdown: broadcast::Receiver<()>,
+    mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
     use crate::transports::ClientHandle;
 
-    // Channel: new clients arrive from the transport
-    let (new_client_tx, mut new_client_rx) = mpsc::channel::<ClientHandle>(32);
-    // Shared channel: all connected clients send device writes here
+    let bridge_name = cfg.name.clone();
+    let read_only = cfg.read_only;
+    let max_clients = cfg.max_clients;
+
+    // Channel: transport → bridge (new client connections)
+    let (new_client_tx, new_client_rx) = mpsc::channel::<ClientHandle>(32);
+    // Shared channel: all client writes are funnelled here; driver loop drains & forwards
     let (device_write_tx, mut device_write_rx) = mpsc::channel::<Bytes>(1024);
 
-    let mut conn_mgr = ConnectionManager::new(
-        cfg.name.clone(),
+    // Connection manager shared between client intake task and driver loop.
+    // Arc<Mutex> so both can access it independently.
+    let conn_mgr = Arc::new(parking_lot::Mutex::new(ConnectionManager::new(
+        bridge_name.clone(),
         metrics.clone(),
-        log_buffer.clone(),
-    );
+        log_buffer,
+    )));
 
-    let max_clients = cfg.max_clients;
-    let read_only = cfg.read_only;
-
-    // Spawn transport listener in a separate task, propagate bind errors immediately
+    // ── Transport ────────────────────────────────────────────────────────────
+    // One shutdown channel for the transport listener — dropped when run_bridge ends.
+    let (transport_sd_tx, _) = broadcast::channel::<()>(1);
     let transport_cfg = cfg.transport.clone();
-    let tx_clone = new_client_tx.clone();
-    let _shutdown_rx = shutdown;
-    let (sd_tx, _) = broadcast::channel::<()>(1);
-    let sd_rx = sd_tx.subscribe();
 
-    // Try binding transport listener, propagate errors
-    let bind_result = match &transport_cfg {
-        TransportConfig::Tcp(tcp_cfg) => {
-            tokio::net::TcpListener::bind(&tcp_cfg.listen).await.map_err(|e| {
-                error!(bridge = %cfg.name, error = %e, "TCP bind failed");
-                crate::error::IoToNetError::Transport(format!("TCP bind {} failed: {}", tcp_cfg.listen, e))
-            })
+    // Probe-bind to catch misconfiguration early (listener is dropped immediately).
+    {
+        let probe = match &transport_cfg {
+            TransportConfig::Tcp(c) => tokio::net::TcpListener::bind(&c.listen).await
+                .map_err(|e| crate::error::IoToNetError::Transport(
+                    format!("TCP bind {} failed: {}", c.listen, e))),
+            TransportConfig::Tls(c) => tokio::net::TcpListener::bind(&c.listen).await
+                .map_err(|e| crate::error::IoToNetError::Transport(
+                    format!("TLS bind {} failed: {}", c.listen, e))),
+            TransportConfig::WebSocket(c) => tokio::net::TcpListener::bind(&c.listen).await
+                .map_err(|e| crate::error::IoToNetError::Transport(
+                    format!("WS bind {} failed: {}", c.listen, e))),
+        };
+        if let Err(e) = probe {
+            error!(bridge = %bridge_name, error = %e, "Transport bind failed");
+            return Err(e);
         }
-        TransportConfig::Tls(tls_cfg) => {
-            tokio::net::TcpListener::bind(&tls_cfg.listen).await.map_err(|e| {
-                error!(bridge = %cfg.name, error = %e, "TLS bind failed");
-                crate::error::IoToNetError::Transport(format!("TLS bind {} failed: {}", tls_cfg.listen, e))
-            })
-        }
-        TransportConfig::WebSocket(ws_cfg) => {
-            tokio::net::TcpListener::bind(&ws_cfg.listen).await.map_err(|e| {
-                error!(bridge = %cfg.name, error = %e, "WebSocket bind failed");
-                crate::error::IoToNetError::Transport(format!("WebSocket bind {} failed: {}", ws_cfg.listen, e))
-            })
-        }
-    };
-    if let Err(e) = bind_result {
-        return Err(e);
-    }
-    // Spawn actual transport listener
+    } // probe listener dropped here — port is free for the real listener
+
+    let sd_rx = transport_sd_tx.subscribe();
+    let tx_clone = new_client_tx.clone();
     tokio::spawn(async move {
         match transport_cfg {
-            TransportConfig::Tcp(tcp_cfg) => {
-                let _ = tcp::run_tcp_listener(tcp_cfg, tx_clone, max_clients, sd_rx).await;
-            }
-            TransportConfig::Tls(tls_cfg) => {
-                let _ = tls::run_tls_listener(tls_cfg, tx_clone, max_clients, sd_rx).await;
-            }
-            TransportConfig::WebSocket(ws_cfg) => {
-                let _ = websocket::run_ws_listener(ws_cfg, tx_clone, max_clients, sd_rx).await;
-            }
+            TransportConfig::Tcp(c)        => { let _ = tcp::run_tcp_listener(c, tx_clone, max_clients, sd_rx).await; }
+            TransportConfig::Tls(c)        => { let _ = tls::run_tls_listener(c, tx_clone, max_clients, sd_rx).await; }
+            TransportConfig::WebSocket(c)  => { let _ = websocket::run_ws_listener(c, tx_clone, max_clients, sd_rx).await; }
         }
     });
-    // Hold sd_tx alive so listener gets shutdown when we drop it on bridge end
-    let _ = sd_tx; // keep alive; will drop at task end
+    // transport_sd_tx kept alive until run_bridge returns — dropping it stops the listener.
 
+    // ── Client intake task ───────────────────────────────────────────────────
+    // Completely independent of driver state. Clients are accepted at all times.
+    {
+        let conn_mgr = Arc::clone(&conn_mgr);
+        let dw_tx = device_write_tx.clone();
+        let name = bridge_name.clone();
+        tokio::spawn(async move {
+            let mut new_client_rx = new_client_rx;
+            while let Some(client) = new_client_rx.recv().await {
+                info!(
+                    bridge = %name,
+                    addr  = %client.addr,
+                    id    = %client.id,
+                    "Client connected"
+                );
+                conn_mgr.lock().add_client(
+                    client.id,
+                    client.addr,
+                    client.tx,
+                    client.rx,
+                    dw_tx.clone(),
+                    read_only,
+                );
+            }
+            debug!(bridge = %name, "Client intake task ended");
+        });
+    }
+
+    // ── Driver loop ──────────────────────────────────────────────────────────
+    // Retries hardware open with exponential backoff. During backoff the transport
+    // and client intake keep running so clients can connect and stay connected.
     let mut buf = [0u8; 4096];
     let mut detector = ProtocolDetector::new();
-    let mut failure_count = 0;
-    let mut backoff_ms = 500;
-    const FAILURE_LIMIT: u32 = 8;
+    let mut last_hint = crate::protocol::ProtocolHint::Unknown;
+    let mut failure_count: u32 = 0;
+    let mut backoff_ms: u64 = 1_000;
 
-    loop {
-        // Try to open hardware driver, retry with backoff if fails
+    'outer: loop {
+        // Respect shutdown signal
+        if shutdown.try_recv().is_ok() {
+            info!(bridge = %bridge_name, "Shutdown received");
+            break;
+        }
+
+        // Create driver
         let mut driver = match create_driver(&cfg.source) {
             Ok(d) => d,
             Err(e) => {
-                error!(bridge = %cfg.name, error = %e, "Driver creation failed");
-                failure_count += 1;
-                let wait_ms = if failure_count >= FAILURE_LIMIT {
-                    warn!(bridge = %cfg.name, failures = failure_count, "Too many consecutive driver failures, increasing backoff");
-                    failure_count = 0;
-                    backoff_ms = 500;
-                    30_000
-                } else {
-                    let w = backoff_ms;
-                    backoff_ms = (backoff_ms * 2).min(10_000);
-                    w
-                };
-                // Accept clients while waiting to retry the driver.
-                run_client_loop(&mut conn_mgr, &mut new_client_rx, None, &mut detector, &mut buf,
-                    Some(std::time::Duration::from_millis(wait_ms)), metrics.clone(), &cfg.name,
-                    &device_write_tx, &mut device_write_rx, read_only).await;
+                let wait = driver_backoff(&mut failure_count, &mut backoff_ms);
+                error!(bridge = %bridge_name, error = %e, wait_ms = wait, "Driver creation failed");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(wait)) => {}
+                    _ = shutdown.recv() => { break 'outer; }
+                }
                 continue;
             }
         };
+
+        // Open driver
         match driver.open().await {
             Ok(_) => {
+                info!(bridge = %bridge_name, "Hardware driver opened");
                 failure_count = 0;
-                backoff_ms = 500;
+                backoff_ms = 1_000;
             }
             Err(e) => {
-                error!(bridge = %cfg.name, error = %e, "Driver open failed");
-                failure_count += 1;
-                let wait_ms = if failure_count >= FAILURE_LIMIT {
-                    warn!(bridge = %cfg.name, failures = failure_count, "Too many consecutive driver failures, increasing backoff");
-                    failure_count = 0;
-                    backoff_ms = 500;
-                    30_000
-                } else {
-                    let w = backoff_ms;
-                    backoff_ms = (backoff_ms * 2).min(10_000);
-                    w
-                };
-                // Accept clients while waiting to retry the driver.
-                run_client_loop(&mut conn_mgr, &mut new_client_rx, None, &mut detector, &mut buf,
-                    Some(std::time::Duration::from_millis(wait_ms)), metrics.clone(), &cfg.name,
-                    &device_write_tx, &mut device_write_rx, read_only).await;
+                let wait = driver_backoff(&mut failure_count, &mut backoff_ms);
+                error!(bridge = %bridge_name, error = %e, wait_ms = wait, "Driver open failed");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(wait)) => {}
+                    _ = shutdown.recv() => { break 'outer; }
+                }
                 continue;
             }
         }
 
-        // Main bridge loop: process clients and hardware reads
-        run_client_loop(&mut conn_mgr, &mut new_client_rx, Some(driver.as_mut()), &mut detector, &mut buf,
-            None, metrics.clone(), &cfg.name, &device_write_tx, &mut device_write_rx, read_only).await;
-    }
-
-}
-
-async fn run_client_loop(
-    conn_mgr: &mut crate::core::connection_manager::ConnectionManager,
-    new_client_rx: &mut tokio::sync::mpsc::Receiver<crate::transports::ClientHandle>,
-    mut driver: Option<&mut dyn crate::drivers::IoDriver>,
-    detector: &mut crate::protocol::ProtocolDetector,
-    buf: &mut [u8; 4096],
-    no_driver_timeout: Option<std::time::Duration>,
-    metrics: Arc<RwLock<GlobalMetrics>>,
-    bridge_name: &str,
-    device_write_tx: &tokio::sync::mpsc::Sender<bytes::Bytes>,
-    device_write_rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>,
-    read_only: bool,
-) {
-    // When there is no hardware driver, run until the retry deadline then break
-    // so the outer loop can attempt to open the driver again.
-    let deadline = no_driver_timeout.map(|d| tokio::time::Instant::now() + d);
-
-    // Track the last hint we pushed to metrics so we only lock on changes.
-    let mut last_hint = crate::protocol::ProtocolHint::Unknown;
-
-    loop {
-        // Drain any pending client→device writes and forward to hardware (best-effort).
-        // Done before the select so driver isn't borrowed in two places simultaneously.
-        if !read_only {
-            while let Ok(data) = device_write_rx.try_recv() {
-                if let Some(d) = driver.as_mut() {
-                    let _ = d.write(&data).await;
-                }
+        // Hardware read loop
+        info!(bridge = %bridge_name, "Hardware data loop started");
+        loop {
+            if shutdown.try_recv().is_ok() {
+                info!(bridge = %bridge_name, "Shutdown received during read loop");
+                break 'outer;
             }
-        } else {
-            // Drain and discard so the channel never fills up.
-            while device_write_rx.try_recv().is_ok() {}
-        }
 
-        tokio::select! {
-            // New client connected via transport
-            client = new_client_rx.recv() => {
-                if let Some(client) = client {
-                    // Clone the shared sender so client writes go to the shared channel.
-                    conn_mgr.add_client(
-                        client.id,
-                        client.addr,
-                        client.tx,
-                        client.rx,
-                        device_write_tx.clone(),
-                        read_only,
-                    );
-                }
-            }
-            // Data from driver (hardware → broadcast to clients), or backoff sleep
-            // when no driver is present.
-            result = async {
-                if let Some(d) = driver.as_mut() {
-                    match d.read(buf).await {
-                        Err(_) => Err(true),  // hardware error → break
-                        Ok(n)  => Ok(n),
+            // Forward any pending client writes to hardware before reading.
+            if !read_only {
+                while let Ok(data) = device_write_rx.try_recv() {
+                    debug!(bridge = %bridge_name, bytes = data.len(), "Forwarding client write to hardware");
+                    if let Err(e) = driver.write(&data).await {
+                        warn!(bridge = %bridge_name, error = %e, "Hardware write failed");
                     }
-                } else if let Some(dl) = deadline {
-                    tokio::time::sleep_until(dl).await;
-                    Err(false)  // backoff elapsed → break to retry driver
-                } else {
-                    std::future::pending::<crate::error::Result<usize>>().await
-                        .map_err(|_| true)
                 }
-            } => {
-                match result {
-                    Err(_)  => break,
-                    Ok(0)   => {}  // read timeout / no data
-                    Ok(n)   => {
-                        detector.feed(&buf[..n]);
-                        let hint = detector.hint().clone();
-                        trace!(protocol_hint = ?hint, "Protocol detection updated");
+            } else {
+                // Drain and discard — keeps the channel from filling up.
+                while device_write_rx.try_recv().is_ok() {}
+            }
 
-                        // Push updated protocol stats to metrics when the hint changes.
-                        if hint != last_hint {
-                            last_hint = hint.clone();
-                            let stats = detector.stats();
-                            let mut m = metrics.write();
-                            if let Some(bm) = m.bridges.get_mut(bridge_name) {
-                                bm.protocol_hint = hint;
-                                bm.message_rate = stats.message_rate;
-                                bm.avg_frame_size = stats.avg_frame_size;
-                            }
+            match driver.read(&mut buf).await {
+                Err(e) => {
+                    let wait = driver_backoff(&mut failure_count, &mut backoff_ms);
+                    error!(bridge = %bridge_name, error = %e, wait_ms = wait, "Hardware read error — going offline");
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(wait)) => {}
+                        _ = shutdown.recv() => { break 'outer; }
+                    }
+                    break; // retry driver open
+                }
+                Ok(0) => {
+                    trace!(bridge = %bridge_name, "Hardware read: no data (timeout)");
+                }
+                Ok(n) => {
+                    trace!(bridge = %bridge_name, bytes = n, "Hardware data received");
+
+                    // Protocol detection (locks metrics only when hint changes).
+                    detector.feed(&buf[..n]);
+                    let hint = detector.hint().clone();
+                    if hint != last_hint {
+                        last_hint = hint.clone();
+                        let stats = detector.stats();
+                        info!(bridge = %bridge_name, protocol = %hint, "Protocol detected");
+                        let mut m = metrics.write();
+                        if let Some(bm) = m.bridges.get_mut(&bridge_name) {
+                            bm.protocol_hint = hint;
+                            bm.message_rate = stats.message_rate;
+                            bm.avg_frame_size = stats.avg_frame_size;
                         }
-
-                        let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                        conn_mgr.broadcast(data);
                     }
+
+                    // Broadcast to all subscribed client tasks.
+                    let data = Bytes::copy_from_slice(&buf[..n]);
+                    conn_mgr.lock().broadcast(data);
+                    trace!(bridge = %bridge_name, bytes = n, "Broadcast sent");
                 }
             }
         }
     }
+
+    // Dropping transport_sd_tx here signals the transport listener to stop.
+    drop(transport_sd_tx);
+    Ok(())
 }
 
 fn source_description(cfg: &BridgeConfig) -> String {
