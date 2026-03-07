@@ -286,60 +286,91 @@ async fn run_bridge(
 
     let mut buf = [0u8; 4096];
     let mut detector = ProtocolDetector::new();
+    let mut failure_count = 0;
+    let mut backoff_ms = 500;
 
     loop {
-        tokio::select! {
-            // New client connected via transport
-            client = new_client_rx.recv() => {
-                if let Some(client) = client {
-                    let dw_tx = device_write_tx.clone();
-                    conn_mgr.add_client(
-                        client.id,
-                        client.addr,
-                        client.tx,
-                        client.rx,
-                        dw_tx,
-                        read_only,
-                    );
-                }
+        // Try to open hardware driver, retry with backoff if fails
+        let mut driver = match create_driver(&cfg.source) {
+            Ok(d) => d,
+            Err(e) => {
+                error!(bridge = %cfg.name, error = %e, "Driver creation failed");
+                failure_count += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(10000);
+                continue;
             }
+        };
+        match driver.open().await {
+            Ok(_) => {
+                failure_count = 0;
+                backoff_ms = 500;
+            }
+            Err(e) => {
+                error!(bridge = %cfg.name, error = %e, "Driver open failed");
+                failure_count += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(10000);
+                continue;
+            }
+        }
 
-            // Data from driver (hardware → broadcast to clients)
-            read_result = driver.read(&mut buf) => {
-                match read_result {
-                    Err(e) => {
-                        error!(bridge = %cfg.name, error = %e, "Driver read error");
-                        // Instead of exiting, log and continue (optionally add backoff)
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        continue;
+        // Main bridge loop: process clients and hardware reads
+        loop {
+            tokio::select! {
+                // New client connected via transport
+                client = new_client_rx.recv() => {
+                    if let Some(client) = client {
+                        let dw_tx = device_write_tx.clone();
+                        conn_mgr.add_client(
+                            client.id,
+                            client.addr,
+                            client.tx,
+                            client.rx,
+                            dw_tx,
+                            read_only,
+                        );
                     }
-                    Ok(0) => {}  // timeout, no data
-                    Ok(n) => {
-                        let data = Bytes::copy_from_slice(&buf[..n]);
-                        // Side-channel protocol observer — never modifies data.
-                        detector.feed(&buf[..n]);
-                        // Publish updated hint to metrics.
-                        {
-                            let stats = detector.stats();
-                            let mut m = metrics.write();
-                            if let Some(bm) = m.bridges.get_mut(&cfg.name) {
-                                bm.add_rx(n as u64);
-                                bm.protocol_hint = detector.hint().clone();
-                                bm.message_rate = stats.message_rate;
-                                bm.avg_frame_size = stats.avg_frame_size;
-                            }
+                }
+
+                // Data from driver (hardware → broadcast to clients)
+                read_result = driver.read(&mut buf) => {
+                    match read_result {
+                        Err(e) => {
+                            error!(bridge = %cfg.name, error = %e, "Driver read error");
+                            failure_count += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                            backoff_ms = (backoff_ms * 2).min(10000);
+                            break; // Restart driver
                         }
-                        conn_mgr.broadcast(data);
+                        Ok(0) => {}  // timeout, no data
+                        Ok(n) => {
+                            let data = Bytes::copy_from_slice(&buf[..n]);
+                            // Side-channel protocol observer — never modifies data.
+                            detector.feed(&buf[..n]);
+                            // Publish updated hint to metrics.
+                            {
+                                let stats = detector.stats();
+                                let mut m = metrics.write();
+                                if let Some(bm) = m.bridges.get_mut(&cfg.name) {
+                                    bm.add_rx(n as u64);
+                                    bm.protocol_hint = detector.hint().clone();
+                                    bm.message_rate = stats.message_rate;
+                                    bm.avg_frame_size = stats.avg_frame_size;
+                                }
+                            }
+                            conn_mgr.broadcast(data);
+                        }
                     }
                 }
-            }
 
-            // Data from client (client → hardware device)
-            write_data = device_write_rx.recv() => {
-                if let Some(data) = write_data {
-                    if !read_only {
-                        if let Err(e) = driver.write(&data).await {
-                            warn!(bridge = %cfg.name, error = %e, "Driver write error");
+                // Data from client (client → hardware device)
+                write_data = device_write_rx.recv() => {
+                    if let Some(data) = write_data {
+                        if !read_only {
+                            if let Err(e) = driver.write(&data).await {
+                                warn!(bridge = %cfg.name, error = %e, "Driver write error");
+                            }
                         }
                     }
                 }
