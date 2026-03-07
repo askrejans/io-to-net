@@ -236,28 +236,51 @@ async fn run_bridge(
     let max_clients = cfg.max_clients;
     let read_only = cfg.read_only;
 
-    // Await transport listener startup and propagate errors
+    // Spawn transport listener in a separate task, propagate bind errors immediately
     let transport_cfg = cfg.transport.clone();
     let tx_clone = new_client_tx.clone();
     let _shutdown_rx = shutdown;
     let (sd_tx, _) = broadcast::channel::<()>(1);
     let sd_rx = sd_tx.subscribe();
 
-    let transport_result = match transport_cfg {
+    // Try binding transport listener, propagate errors
+    let bind_result = match &transport_cfg {
         TransportConfig::Tcp(tcp_cfg) => {
-            tcp::run_tcp_listener(tcp_cfg, tx_clone, max_clients, sd_rx).await
+            tokio::net::TcpListener::bind(&tcp_cfg.listen).await.map_err(|e| {
+                error!(bridge = %cfg.name, error = %e, "TCP bind failed");
+                crate::error::IoToNetError::Transport(format!("TCP bind {} failed: {}", tcp_cfg.listen, e))
+            })
         }
         TransportConfig::Tls(tls_cfg) => {
-            tls::run_tls_listener(tls_cfg, tx_clone, max_clients, sd_rx).await
+            tokio::net::TcpListener::bind(&tls_cfg.listen).await.map_err(|e| {
+                error!(bridge = %cfg.name, error = %e, "TLS bind failed");
+                crate::error::IoToNetError::Transport(format!("TLS bind {} failed: {}", tls_cfg.listen, e))
+            })
         }
         TransportConfig::WebSocket(ws_cfg) => {
-            websocket::run_ws_listener(ws_cfg, tx_clone, max_clients, sd_rx).await
+            tokio::net::TcpListener::bind(&ws_cfg.listen).await.map_err(|e| {
+                error!(bridge = %cfg.name, error = %e, "WebSocket bind failed");
+                crate::error::IoToNetError::Transport(format!("WebSocket bind {} failed: {}", ws_cfg.listen, e))
+            })
         }
     };
-    if let Err(e) = transport_result {
-        error!(bridge = %cfg.name, error = %e, "Transport listener failed to start");
+    if let Err(e) = bind_result {
         return Err(e);
     }
+    // Spawn actual transport listener
+    tokio::spawn(async move {
+        match transport_cfg {
+            TransportConfig::Tcp(tcp_cfg) => {
+                let _ = tcp::run_tcp_listener(tcp_cfg, tx_clone, max_clients, sd_rx).await;
+            }
+            TransportConfig::Tls(tls_cfg) => {
+                let _ = tls::run_tls_listener(tls_cfg, tx_clone, max_clients, sd_rx).await;
+            }
+            TransportConfig::WebSocket(ws_cfg) => {
+                let _ = websocket::run_ws_listener(ws_cfg, tx_clone, max_clients, sd_rx).await;
+            }
+        }
+    });
     // Hold sd_tx alive so listener gets shutdown when we drop it on bridge end
     let _ = sd_tx; // keep alive; will drop at task end
 
