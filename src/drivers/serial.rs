@@ -1,12 +1,17 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::config::{SerialConfig, SerialFlowControl, SerialParity};
 use crate::error::{IoToNetError, Result};
 
 use super::IoDriver;
+
+/// After this many *consecutive* transient errors (BrokenPipe / Interrupted)
+/// without a successful read, the driver gives up and forces a port reopen.
+/// At 100 ms timeout per read that is ~3 seconds of silence before reconnecting.
+const MAX_TRANSIENT_ERRORS: u32 = 30;
 
 /// Wraps `Box<dyn serialport::SerialPort>` to make it `Send`.
 ///
@@ -24,12 +29,23 @@ unsafe impl Sync for SerialPortHandle {}
 pub struct SerialDriver {
     cfg: SerialConfig,
     port: Option<SerialPortHandle>,
+    /// Counts consecutive transient errors (BrokenPipe / Interrupted).
+    /// Reset to 0 on any successful byte read.
+    transient_error_count: u32,
 }
 
 impl SerialDriver {
     pub fn new(cfg: SerialConfig) -> Self {
-        SerialDriver { cfg, port: None }
+        SerialDriver { cfg, port: None, transient_error_count: 0 }
     }
+}
+
+/// Outcome returned from the `spawn_blocking` read closure.
+enum ReadOutcome {
+    Data(SerialPortHandle, Vec<u8>, usize),
+    Timeout(SerialPortHandle),
+    Transient(SerialPortHandle, String), // BrokenPipe / Interrupted — may self-heal
+    Fatal(SerialPortHandle, String),
 }
 
 #[async_trait]
@@ -72,6 +88,7 @@ impl IoDriver for SerialDriver {
                 format!("Cannot open serial port {}: {}", self.cfg.port, e)))?;
 
         self.port = Some(SerialPortHandle(port));
+        self.transient_error_count = 0;
         debug!(port = %self.cfg.port, baud = self.cfg.baud, "Serial port opened");
         Ok(())
     }
@@ -84,28 +101,58 @@ impl IoDriver for SerialDriver {
 
         // Run the blocking serial read on a dedicated thread so the tokio executor
         // is not stalled. Mirrors the I2C driver pattern which is known to work.
-        let result = tokio::task::spawn_blocking(move || {
+        let outcome = tokio::task::spawn_blocking(move || {
             use std::io::Read;
             let mut tmp = vec![0u8; read_len];
             match handle.0.read(&mut tmp) {
-                Ok(n)  => Ok((handle, tmp, n)),
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut  => Ok((handle, tmp, 0)),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok((handle, tmp, 0)),
-                Err(e) => Err((handle, format!("{e}"))),
+                Ok(0) => ReadOutcome::Timeout(handle),
+                Ok(n) => ReadOutcome::Data(handle, tmp, n),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut  => ReadOutcome::Timeout(handle),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => ReadOutcome::Timeout(handle),
+                // BrokenPipe / Interrupted are transient on Linux UARTs (modem signal
+                // glitches, GPS module resets). Retry without reopening the port.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe   => ReadOutcome::Transient(handle, format!("{e}")),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted  => ReadOutcome::Transient(handle, format!("{e}")),
+                Err(e) => ReadOutcome::Fatal(handle, format!("{e}")),
             }
         })
         .await
         .map_err(|e| IoToNetError::Driver(format!("Serial read spawn_blocking: {e}")))?;
 
-        match result {
-            Ok((handle, data, n)) => {
+        match outcome {
+            ReadOutcome::Data(handle, data, n) => {
                 self.port = Some(handle);
-                if n > 0 {
-                    buf[..n].copy_from_slice(&data[..n]);
-                }
+                self.transient_error_count = 0;
+                buf[..n].copy_from_slice(&data[..n]);
                 Ok(n)
             }
-            Err((handle, msg)) => {
+            ReadOutcome::Timeout(handle) => {
+                self.port = Some(handle);
+                Ok(0)
+            }
+            ReadOutcome::Transient(handle, msg) => {
+                self.port = Some(handle);
+                self.transient_error_count += 1;
+                if self.transient_error_count < MAX_TRANSIENT_ERRORS {
+                    trace!(
+                        error = %msg,
+                        count = self.transient_error_count,
+                        max = MAX_TRANSIENT_ERRORS,
+                        "Serial transient error — retrying"
+                    );
+                    Ok(0) // caller loops and retries; no port reopen needed
+                } else {
+                    // Too many consecutive transient errors — something is genuinely wrong.
+                    warn!(
+                        error = %msg,
+                        count = self.transient_error_count,
+                        "Serial transient errors exceeded threshold — forcing port reopen"
+                    );
+                    self.transient_error_count = 0;
+                    Err(IoToNetError::Driver(msg))
+                }
+            }
+            ReadOutcome::Fatal(handle, msg) => {
                 self.port = Some(handle);
                 warn!(error = %msg, "Serial read error");
                 Err(IoToNetError::Driver(msg))
