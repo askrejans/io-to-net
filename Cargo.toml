@@ -1,6 +1,6 @@
 [package]
 name = "io-to-net"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Universal hardware IO bridge — exposes local hardware interfaces over TCP/IP"
 license = "GPL-3.0"
@@ -85,7 +85,7 @@ nix = { version = "0.31.2", features = ["ioctl", "fs", "term", "process", "signa
 i2cdev = "0.6"
 gpio-cdev = "0.6"
 socketcan = "3"
-libc = "0.2"
+libc = "0.2.183"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -70,14 +70,19 @@ impl IoDriver for SerialDriver {
         use tokio::io::AsyncReadExt;
         match &mut self.port {
             None => Err(IoToNetError::Driver("Serial port not opened".to_string())),
-            Some(port) => match port.read(buf).await {
-                Ok(n) => Ok(n),
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(0),
-                Err(e) => {
-                    warn!(error = %e, "Serial read error");
-                    Err(IoToNetError::Network(e))
+            Some(port) => {
+                let timeout = std::time::Duration::from_millis(self.cfg.read_timeout_ms);
+                match tokio::time::timeout(timeout, port.read(buf)).await {
+                    Err(_) => Ok(0), // timeout — no data within the window
+                    Ok(Ok(0)) => Ok(0), // EOF / no data
+                    Ok(Ok(n)) => Ok(n),
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::TimedOut => Ok(0),
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "Serial read error");
+                        Err(IoToNetError::Network(e))
+                    }
                 }
-            },
+            }
         }
     }
 
