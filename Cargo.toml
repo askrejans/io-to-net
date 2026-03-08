@@ -37,7 +37,6 @@ thiserror = "2.0.18"
 
 # Serial port
 serialport = "4.8.1"
-tokio-serial = "5"
 
 # TLS
 rustls = { version = "0.23", features = ["ring"] }

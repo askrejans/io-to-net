@@ -1,5 +1,6 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
-use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use tracing::{debug, warn};
 
 use crate::config::{SerialConfig, SerialFlowControl, SerialParity};
@@ -7,9 +8,22 @@ use crate::error::{IoToNetError, Result};
 
 use super::IoDriver;
 
+/// Wraps `Box<dyn serialport::SerialPort>` to make it `Send`.
+///
+/// All serialport concrete implementations (`TTYPort` on Unix, `COMPort` on Windows)
+/// are `Send`. The `dyn SerialPort` trait object erases that bound, so we restore it
+/// here to allow moving the port into `spawn_blocking` closures.
+struct SerialPortHandle(Box<dyn serialport::SerialPort>);
+
+// SAFETY: All concrete serialport implementations (TTYPort/COMPort) are Send.
+// Sync is also safe here because SerialDriver only accesses the port through
+// &mut self, so no concurrent shared references are ever possible.
+unsafe impl Send for SerialPortHandle {}
+unsafe impl Sync for SerialPortHandle {}
+
 pub struct SerialDriver {
     cfg: SerialConfig,
-    port: Option<SerialStream>,
+    port: Option<SerialPortHandle>,
 }
 
 impl SerialDriver {
@@ -21,10 +35,7 @@ impl SerialDriver {
 #[async_trait]
 impl IoDriver for SerialDriver {
     async fn open(&mut self) -> Result<()> {
-        use serialport::FlowControl;
-        use tokio_serial::DataBits;
-        use tokio_serial::Parity;
-        use tokio_serial::StopBits;
+        use serialport::{DataBits, FlowControl, Parity, StopBits};
 
         let data_bits = match self.cfg.data_bits {
             5 => DataBits::Five,
@@ -35,7 +46,7 @@ impl IoDriver for SerialDriver {
 
         let parity = match self.cfg.parity {
             SerialParity::None => Parity::None,
-            SerialParity::Odd => Parity::Odd,
+            SerialParity::Odd  => Parity::Odd,
             SerialParity::Even => Parity::Even,
         };
 
@@ -45,55 +56,88 @@ impl IoDriver for SerialDriver {
         };
 
         let flow_control = match self.cfg.flow_control {
-            SerialFlowControl::None => FlowControl::None,
+            SerialFlowControl::None     => FlowControl::None,
             SerialFlowControl::Software => FlowControl::Software,
             SerialFlowControl::Hardware => FlowControl::Hardware,
         };
 
-        let builder = tokio_serial::new(&self.cfg.port, self.cfg.baud)
+        let port = serialport::new(&self.cfg.port, self.cfg.baud)
             .data_bits(data_bits)
             .parity(parity)
             .stop_bits(stop_bits)
             .flow_control(flow_control)
-            .timeout(std::time::Duration::from_millis(self.cfg.read_timeout_ms));
+            .timeout(Duration::from_millis(self.cfg.read_timeout_ms))
+            .open()
+            .map_err(|e| IoToNetError::Driver(
+                format!("Cannot open serial port {}: {}", self.cfg.port, e)))?;
 
-        let stream = builder
-            .open_native_async()
-            .map_err(|e| IoToNetError::Driver(format!("Cannot open serial port {}: {}", self.cfg.port, e)))?;
-
-        self.port = Some(stream);
+        self.port = Some(SerialPortHandle(port));
         debug!(port = %self.cfg.port, baud = self.cfg.baud, "Serial port opened");
         Ok(())
     }
 
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        use tokio::io::AsyncReadExt;
-        match &mut self.port {
-            None => Err(IoToNetError::Driver("Serial port not opened".to_string())),
-            Some(port) => {
-                let timeout = std::time::Duration::from_millis(self.cfg.read_timeout_ms);
-                match tokio::time::timeout(timeout, port.read(buf)).await {
-                    Err(_) => Ok(0), // timeout — no data within the window
-                    Ok(Ok(0)) => Ok(0), // EOF / no data
-                    Ok(Ok(n)) => Ok(n),
-                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::TimedOut => Ok(0),
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "Serial read error");
-                        Err(IoToNetError::Network(e))
-                    }
+        let mut handle = self.port.take()
+            .ok_or_else(|| IoToNetError::Driver("Serial port not opened".to_string()))?;
+
+        let read_len = buf.len();
+
+        // Run the blocking serial read on a dedicated thread so the tokio executor
+        // is not stalled. Mirrors the I2C driver pattern which is known to work.
+        let result = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut tmp = vec![0u8; read_len];
+            match handle.0.read(&mut tmp) {
+                Ok(n)  => Ok((handle, tmp, n)),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut  => Ok((handle, tmp, 0)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok((handle, tmp, 0)),
+                Err(e) => Err((handle, format!("{e}"))),
+            }
+        })
+        .await
+        .map_err(|e| IoToNetError::Driver(format!("Serial read spawn_blocking: {e}")))?;
+
+        match result {
+            Ok((handle, data, n)) => {
+                self.port = Some(handle);
+                if n > 0 {
+                    buf[..n].copy_from_slice(&data[..n]);
                 }
+                Ok(n)
+            }
+            Err((handle, msg)) => {
+                self.port = Some(handle);
+                warn!(error = %msg, "Serial read error");
+                Err(IoToNetError::Driver(msg))
             }
         }
     }
 
     async fn write(&mut self, data: &[u8]) -> Result<usize> {
-        use tokio::io::AsyncWriteExt;
-        match &mut self.port {
-            None => Err(IoToNetError::Driver("Serial port not opened".to_string())),
-            Some(port) => port
-                .write(data)
-                .await
-                .map_err(IoToNetError::Network),
+        let mut handle = self.port.take()
+            .ok_or_else(|| IoToNetError::Driver("Serial port not opened".to_string()))?;
+
+        let data_owned = data.to_vec();
+
+        let result = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            match handle.0.write(&data_owned) {
+                Ok(n)  => Ok((handle, n)),
+                Err(e) => Err((handle, format!("{e}"))),
+            }
+        })
+        .await
+        .map_err(|e| IoToNetError::Driver(format!("Serial write spawn_blocking: {e}")))?;
+
+        match result {
+            Ok((handle, n)) => {
+                self.port = Some(handle);
+                Ok(n)
+            }
+            Err((handle, msg)) => {
+                self.port = Some(handle);
+                Err(IoToNetError::Driver(msg))
+            }
         }
     }
 
@@ -153,6 +197,6 @@ mod tests {
     async fn close_is_idempotent() {
         let mut d = SerialDriver::new(SerialConfig::default());
         d.close().await.unwrap();
-        d.close().await.unwrap(); // second close should not panic
+        d.close().await.unwrap();
     }
 }
