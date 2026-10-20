@@ -296,6 +296,7 @@ build_deb() {
 Package: $PKG_NAME
 Version: $PKG_VERSION
 Architecture: $deb_arch
+Depends: libdbus-1-3
 Maintainer: $PKG_MAINTAINER
 Description: $PKG_DESCRIPTION
  Exposes serial ports (USB, UART, PTY), SocketCAN, I2C, GPIO, 1-Wire and
@@ -386,6 +387,7 @@ Summary:        $PKG_DESCRIPTION
 License:        $PKG_LICENSE
 URL:            $PKG_URL
 BuildArch:      $rpm_arch
+Requires:       dbus-libs
 
 %global debug_package %{nil}
 
