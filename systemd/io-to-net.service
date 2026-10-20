@@ -1,31 +1,68 @@
 [Unit]
-Description=io-to-net — Universal hardware IO bridge
-Documentation=https://github.com/io-to-net/io-to-net
-After=network.target network-online.target
+Description=io-to-net hardware-to-network bridge (serial, CAN, I2C, GPIO, BLE → TCP/TLS/WebSocket)
+Documentation=https://github.com/askrejans/io-to-net
+After=network-online.target
 Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/io-to-net --daemon --config /etc/io-to-net/config.toml
+User=io-to-net
+Group=io-to-net
+
+# --headless: log to the journal, no terminal dashboard
+ExecStart=/usr/bin/io-to-net --headless --config /etc/io-to-net/config.toml
+# Re-read the config: unchanged bridges keep running with their clients
 ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-RestartSec=5s
-TimeoutStopSec=10s
+
+# PTY sources: put symlinks here (e.g. /run/io-to-net/ttyECU); /tmp is private
+RuntimeDirectory=io-to-net
+RuntimeDirectoryMode=0755
+UMask=0022
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+MemoryMax=256M
 
 # Security hardening
 NoNewPrivileges=true
+PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/log/io-to-net
-PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# IP for clients, UNIX for sockets and D-Bus (BLE), CAN for SocketCAN,
+# NETLINK for interface lookups
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_CAN AF_NETLINK
 
-# Required for hardware access
-SupplementaryGroups=dialout gpio i2c
+# Hardware access goes through group membership (dialout/tty for serial,
+# gpio and i2c where the distribution has them); the package adds the
+# service user to whichever exist. Devices are not hidden (no PrivateDevices).
+SupplementaryGroups=dialout tty
 
-Environment=IO_TO_NET_LOG_LEVEL=info
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+SystemCallErrorNumber=EPERM
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=io-to-net
+
+# Environment="IO_TO_NET_LOG_LEVEL=debug"
 
 [Install]
 WantedBy=multi-user.target

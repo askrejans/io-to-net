@@ -9,3 +9,6 @@ firmware/src/secrets.h
 
 # macOS
 .DS_Store
+
+# Packages (scripts/build_packages.sh)
+/release/

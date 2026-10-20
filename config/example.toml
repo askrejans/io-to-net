@@ -1,198 +1,212 @@
 # io-to-net configuration
-# Copy to /etc/io-to-net/config.toml and edit as needed.
+#
+# Installed as /etc/io-to-net/config.toml (packages) or ./config.toml.
+# Check it with `io-to-net --check-config`; apply edits without a restart
+# with `systemctl reload io-to-net`, SIGHUP, or POST /api/v1/reload — bridges
+# whose settings did not change keep running with their clients.
+# `io-to-net --scan` lists serial ports with the USB selector to paste below.
 
-# Global log level: trace | debug | info | warn | error
+# trace | debug | info | warn | error (overridden by --log-level / IO_TO_NET_LOG_LEVEL)
 log_level = "info"
 
-# ─── HTTP Admin API ──────────────────────────────────────────────
+# ─── HTTP API, web dashboard and /metrics ────────────────────────────────
+# On by default on loopback. To reach it from another machine, listen on
+# 0.0.0.0 and set a token: /api/* then needs "Authorization: Bearer <token>";
+# /health, /metrics and the dashboard page itself stay open.
 [http_api]
 enabled = true
-listen = "0.0.0.0:9106"
-
-# Optional Bearer token authentication
+listen = "127.0.0.1:9106"
+ui = true
+# cors_origin = "http://dashboard.local:8080"
 # [http_api.auth]
-# token = "change-me-in-production"
+# token = "change-me"
 
-# Optional per-second rate limit
-# rate_limit_per_second = 20
+# Optional extra Prometheus-only listener (the HTTP API serves /metrics too).
+# [metrics]
+# enabled = true
+# listen = "0.0.0.0:9105"
 
-# ─── Prometheus Metrics ──────────────────────────────────────────
-[metrics]
-enabled = true
-listen = "0.0.0.0:9105"
+# ─── Bridges ─────────────────────────────────────────────────────────────
+# One [[bridges]] block = one source exposed on one listen address.
+#
+# Common options:
+#   mode         mirror (default): every client gets the stream and may write
+#                exclusive: one client; a new connection replaces the old one.
+#                Use it for request–reply devices (ECUs, MODBUS), where two
+#                pollers would interleave requests, and for tools such as
+#                TunerStudio that reconnect while the old socket looks open.
+#   read_only    clients cannot write to the device
+#   max_clients  limit for mirror mode (default unlimited)
+#   auto_restart reopen the source after a failure (default true; backoff
+#                1 s doubling to 30 s)
+#   frame_mode   none (default, bytes as read) | line (one frame per "\n",
+#                NMEA/AT) | null_terminated (COBS) | length_prefix
+#                ([u16 BE length][data] per read, for sensor polls)
+#   [auth] token clients send the token and "\n" before any data flows
 
-# ─── Bridges ─────────────────────────────────────────────────────
-# Each [[bridges]] block creates one IO→TCP bridge.
-
-# ── Example 1: Serial ECU over TCP ───────────────────────────────
+# ── Speeduino / MegaSquirt ECU on USB ────────────────────────────────────
 [[bridges]]
 name = "ecu"
-max_clients = 10
-mode = "mirror"     # mirror | exclusive | proxy
-read_only = false   # true = clients cannot send data to device
-auto_restart = true
-# frame_mode controls how data is packaged before sending to TCP clients.
-# Omit (or set "none") for raw streaming — client handles its own framing.
-# Options: none | length_prefix | line | null_terminated
-# frame_mode = "none"        # default — raw byte stream
-# frame_mode = "line"        # emit one complete line per \n (NMEA, AT commands)
-# frame_mode = "null_terminated"  # emit one packet per 0x00 byte (COBS streams)
-# frame_mode = "length_prefix"    # prepend [u16 len][data] (I2C, SPI sensor reads)
+mode = "exclusive"
 
 [bridges.source]
 type = "serial"
-port = "/dev/ttyUSB0"
+# A path (/dev/ttyUSB0, /dev/cu.usbmodem1101, COM3) or a USB selector that
+# survives re-plugging: usb:VID:PID, usb:VID:PID:SERIAL, usb:name=<text>
+port = "/dev/ttyACM0"
 baud = 115200
-data_bits = 8
-parity = "none"     # none | odd | even
-stop_bits = 1
-flow_control = "none" # none | software | hardware
+# data_bits = 8
+# parity = "none"         # none | odd | even
+# stop_bits = 1
+# flow_control = "none"   # none | software | hardware
+# Arduino/ESP boards reset when DTR toggles on open; false keeps them running.
+# dtr = false
+# rts = false
 
 [bridges.transport]
 type = "tcp"
 listen = "[::]:9000"
-write_timeout_ms = 5000
+# A client that cannot take data for this long is disconnected.
+# write_timeout_ms = 5000
 
-# ── Example 2: Bluetooth OBD-II adapter ──────────────────────────
+# ── GPS receiver, NMEA one sentence per frame ────────────────────────────
 # [[bridges]]
-# name = "obd"
+# name = "gps"
 # read_only = true
-# auto_restart = true
-#
+# frame_mode = "line"
 # [bridges.source]
-# type = "bluetooth"
-# device = "AA:BB:CC:DD:EE:FF"
-# # Optional BLE GATT characteristic UUID
-# # characteristic_uuid = "0000ffe1-0000-1000-8000-00805f9b34fb"
-#
+# type = "serial"
+# port = "usb:1546:01A8"    # u-blox
+# baud = 9600
 # [bridges.transport]
 # type = "tcp"
 # listen = "[::]:9001"
 
-# ── Example 3: I2C IMU — MPU-6050 (Linux only) ───────────────────
-# Exposes raw accelerometer + gyroscope data (14 bytes) over TCP.
-#
-# Key I2C options:
-#   read_reg   — register address written before each read to set the
-#                device's internal pointer. Required for most sensors.
-#                MPU-6050 accel/gyro data starts at 0x3B.
-#   init_bytes — list of write transactions sent once on open.
-#                MPU-6050 powers up in sleep mode; [0x6B, 0x00] wakes it.
-#                Each inner array is a single I2C write transaction.
-#
-# Clients always connect even if the hardware is offline or being
-# retried — the port stays open and data flows once the device is ready.
-#
+# ── Same GPS for browsers: WebSocket, one NMEA line per message ──────────
+# A tcp_client source can chain from another bridge or a Wi-Fi serial adapter.
 # [[bridges]]
-# name = "imu"
-# read_only = true
-# auto_restart = true
-# frame_mode = "length_prefix"  # prepend each 14-byte read with a 2-byte length
-#                                # client: read 2 bytes → u16 len, then read len bytes
-#
+# name = "gps-ws"
+# frame_mode = "line"
 # [bridges.source]
-# type = "i2c"
-# bus = "/dev/i2c-1"
-# address = 0x68          # MPU-6050 default I2C address
-# read_len = 14           # accel XYZ (6) + temp (2) + gyro XYZ (6)
-# poll_ms = 10            # 100 Hz polling
-# read_reg = 0x3B         # ACCEL_XOUT_H — start of accel data block
-# init_bytes = [[0x6B, 0x00]]  # PWR_MGMT_1 = 0x00: wake from sleep
-#
+# type = "tcp_client"
+# address = "127.0.0.1:9001"
+# # connect_timeout_ms = 5000
 # [bridges.transport]
-# type = "tcp"
-# listen = "[::]:9002"
+# type = "web_socket"
+# listen = "[::]:9080"
 
-# ── Example 3b: I2C pressure sensor — BMP280 (Linux only) ────────
-# BMP280 at 0x77, read 8 raw bytes from 0xF7 after config.
-# Two init writes: set oversampling mode, then set standby time.
-#
-# [[bridges]]
-# name = "baro"
-# read_only = true
-# auto_restart = true
-# frame_mode = "length_prefix"
-#
-# [bridges.source]
-# type = "i2c"
-# bus = "/dev/i2c-1"
-# address = 0x77
-# read_len = 8
-# poll_ms = 50
-# read_reg = 0xF7
-# init_bytes = [
-#   [0xF4, 0x2F],   # ctrl_meas: temp×1, press×1, normal mode
-#   [0xF5, 0xA0],   # config: standby 1s, filter off
-# ]
-#
-# [bridges.transport]
-# type = "tcp"
-# listen = "[::]:9003"
-
-# ── Example 4: CAN bus (Linux only) ──────────────────────────────
-# [[bridges]]
-# name = "can0"
-# read_only = true
-#
-# [bridges.source]
-# type = "canbus"
-# interface = "can0"
-#
-# [bridges.transport]
-# type = "tcp"
-# listen = "[::]:9003"
-
-# ── Example 5: TLS-encrypted TCP bridge ──────────────────────────
+# ── TLS with a token (and optionally client certificates) ────────────────
+# `io-to-net generate-cert --out /etc/io-to-net --cn myhost` makes a
+# self-signed pair for testing.
 # [[bridges]]
 # name = "ecu-tls"
-# auto_restart = true
-#
+# mode = "exclusive"
+# [bridges.auth]
+# token = "change-me"
 # [bridges.source]
-# type = "serial"
-# port = "/dev/ttyUSB1"
-# baud = 115200
-#
+# type = "tcp_client"
+# address = "192.168.4.1:5000"
 # [bridges.transport]
 # type = "tls"
 # listen = "[::]:9443"
 # cert = "/etc/io-to-net/cert.pem"
 # key = "/etc/io-to-net/key.pem"
+# # client_ca = "/etc/io-to-net/clients-ca.pem"   # mutual TLS
 
-# ── Example 6: WebSocket bridge ──────────────────────────────────
+# ── SocketCAN (Linux) ────────────────────────────────────────────────────
+# format: json (default) — one line per frame,
+#           {"id":864,"extended":false,"timestampMs":…,"data":[…]}\n
+#           (the ecu-to-mqtt CAN gateway format)
+#         slcan  — Lawicel ASCII, t3608…\r / T01F0A000…\r
+#         binary — Linux struct can_frame, 16 bytes per frame
+# Clients may send frames back in the same format.
 # [[bridges]]
-# name = "ecu-ws"
-#
+# name = "can"
 # [bridges.source]
-# type = "serial"
-# port = "/dev/ttyUSB0"
-# baud = 115200
-#
+# type = "canbus"
+# interface = "can0"
+# format = "json"
+# # filter_id = 0x360        # only IDs where id & mask == filter_id & mask
+# # filter_mask = 0x7F0
 # [bridges.transport]
-# type = "web_socket"
-# listen = "[::]:9080"
+# type = "tcp"
+# listen = "[::]:9002"
 
-# ── Example 7: PTY (pseudo-terminal, Unix only) ───────────────────
+# ── I2C sensor poll (Linux) — MPU-6050 accelerometer/gyro ────────────────
 # [[bridges]]
-# name = "pty-bridge"
-#
+# name = "imu"
+# read_only = true
+# frame_mode = "length_prefix"
 # [bridges.source]
-# type = "pty"
-# symlink = "/tmp/io-to-net-pty"
-#
+# type = "i2c"
+# bus = "/dev/i2c-1"
+# address = 0x68
+# read_reg = 0x3B           # register written before each read
+# read_len = 14
+# poll_ms = 10
+# init_bytes = [[0x6B, 0x00]]   # wake from sleep
+# [bridges.transport]
+# type = "tcp"
+# listen = "[::]:9003"
+
+# ── GPIO edges (Linux): one byte per event, 0x01 rising, 0x02 falling ────
+# [[bridges]]
+# name = "lap-beacon"
+# read_only = true
+# [bridges.source]
+# type = "gpio"
+# chip = "/dev/gpiochip0"
+# line = 17
+# edge = "both"             # rising | falling | both
 # [bridges.transport]
 # type = "tcp"
 # listen = "[::]:9004"
 
-# ── Example 8: 1-Wire temperature sensor (Linux only) ────────────
+# ── 1-Wire temperature sensor (Linux w1 sysfs) ───────────────────────────
 # [[bridges]]
-# name = "temp"
+# name = "oil-temp"
 # read_only = true
-#
 # [bridges.source]
 # type = "onewire"
 # device = "/sys/bus/w1/devices/28-000000000000"
 # poll_ms = 1000
-#
 # [bridges.transport]
 # type = "tcp"
 # listen = "[::]:9005"
+
+# ── BLE GATT device (notifications in, writes out) ───────────────────────
+# device: MAC address (Linux, Windows) or the peripheral UUID (macOS, shown by
+# `io-to-net --scan`).
+# [[bridges]]
+# name = "obd-ble"
+# [bridges.source]
+# type = "bluetooth"
+# device = "AA:BB:CC:DD:EE:FF"
+# characteristic_uuid = "0000ffe1-0000-1000-8000-00805f9b34fb"
+# write_characteristic_uuid = "0000ffe1-0000-1000-8000-00805f9b34fb"
+# # scan_secs = 5
+# [bridges.transport]
+# type = "tcp"
+# listen = "[::]:9006"
+
+# ── Virtual serial port for local programs (Unix) ────────────────────────
+# Programs open the symlink as a serial port; network clients see the bytes.
+# Under systemd use /run/io-to-net/ (the service has a private /tmp).
+# [[bridges]]
+# name = "pty"
+# [bridges.source]
+# type = "pty"
+# symlink = "/run/io-to-net/ttyVIRT"
+# [bridges.transport]
+# type = "tcp"
+# listen = "[::]:9007"
+
+# ── Unix domain socket device ────────────────────────────────────────────
+# [[bridges]]
+# name = "sock"
+# [bridges.source]
+# type = "unix_socket"
+# path = "/run/mydevice.sock"
+# [bridges.transport]
+# type = "tcp"
+# listen = "[::]:9008"

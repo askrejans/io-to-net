@@ -1,151 +1,93 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+//! rustls server configuration from PEM files, with optional client
+//! certificate verification (mutual TLS).
 
-use bytes::Bytes;
+use std::sync::Arc;
+
+use anyhow::{Context, Result, bail};
+use rustls::RootCertStore;
 use rustls::ServerConfig;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
-use tokio_rustls::TlsAcceptor;
-use tracing::{debug, info, warn};
-use uuid::Uuid;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
 
 use crate::config::TlsTransportConfig;
-use crate::error::{IoToNetError, Result};
 
-use super::ClientHandle;
-
-/// Build a rustls `ServerConfig` from PEM cert and key files.
-pub fn build_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerConfig>> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use rustls_pemfile::{certs, pkcs8_private_keys};
-
-    let cert_pem = std::fs::read(cert_path)
-        .map_err(|e| IoToNetError::Tls(format!("Cannot read cert {}: {}", cert_path, e)))?;
-    let key_pem = std::fs::read(key_path)
-        .map_err(|e| IoToNetError::Tls(format!("Cannot read key {}: {}", key_path, e)))?;
-
-    let certs: Vec<CertificateDer<'static>> = certs(&mut cert_pem.as_slice())
+fn certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let certs = CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("cannot read {path}"))?
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| IoToNetError::Tls(format!("Invalid cert PEM: {}", e)))?;
-
-    let mut keys: Vec<_> = pkcs8_private_keys(&mut key_pem.as_slice())
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| IoToNetError::Tls(format!("Invalid key PEM: {}", e)))?;
-
-    if keys.is_empty() {
-        return Err(IoToNetError::Tls("No PKCS8 private key found in key file".to_string()));
+        .with_context(|| format!("invalid PEM in {path}"))?;
+    if certs.is_empty() {
+        bail!("no certificates in {path}");
     }
+    Ok(certs)
+}
 
-    let key = PrivateKeyDer::Pkcs8(keys.remove(0));
-
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| IoToNetError::Tls(format!("TLS config error: {}", e)))?;
-
+pub fn server_config(cfg: &TlsTransportConfig) -> Result<Arc<ServerConfig>> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let chain = certs(&cfg.cert)?;
+    // PKCS#8, PKCS#1 (RSA) and SEC1 (EC) keys are all accepted.
+    let key = PrivateKeyDer::from_pem_file(&cfg.key)
+        .with_context(|| format!("no private key in {}", cfg.key))?;
+    let builder = ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()?;
+    let builder = match &cfg.client_ca {
+        None => builder.with_no_client_auth(),
+        Some(ca) => {
+            let mut roots = RootCertStore::empty();
+            for c in certs(ca)? {
+                roots
+                    .add(c)
+                    .with_context(|| format!("bad CA certificate in {ca}"))?;
+            }
+            builder.with_client_cert_verifier(
+                WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                    .build()
+                    .context("client CA")?,
+            )
+        }
+    };
+    let config = builder
+        .with_single_cert(chain, key)
+        .context("certificate and key do not match")?;
     Ok(Arc::new(config))
 }
 
-/// Accept loop for TLS transport.
-pub async fn run_tls_listener(
-    cfg: TlsTransportConfig,
-    new_clients_tx: mpsc::Sender<ClientHandle>,
-    max_clients: Option<usize>,
-    mut shutdown: tokio::sync::broadcast::Receiver<()>,
-) -> Result<()> {
-    let tls_config = build_tls_config(&cfg.cert, &cfg.key)?;
-    let acceptor = TlsAcceptor::from(tls_config);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let listener = TcpListener::bind(&cfg.listen)
-        .await
-        .map_err(|e| IoToNetError::Transport(format!("TLS bind {} failed: {}", cfg.listen, e)))?;
-
-    info!(listen = %cfg.listen, "TLS transport listening");
-
-    let mut client_count = 0usize;
-
-    loop {
-        tokio::select! {
-            accept = listener.accept() => {
-                match accept {
-                    Err(e) => { warn!(error = %e, "TLS accept error"); continue; }
-                    Ok((stream, addr)) => {
-                        if let Some(max) = max_clients {
-                            if client_count >= max {
-                                warn!(addr = %addr, "Max clients reached, refusing TLS connection");
-                                drop(stream);
-                                continue;
-                            }
-                        }
-                        let acc = acceptor.clone();
-                        let timeout = Duration::from_millis(cfg.write_timeout_ms);
-                        let clients_tx = new_clients_tx.clone();
-                        tokio::spawn(async move {
-                            match acc.accept(stream).await {
-                                Err(e) => { warn!(addr = %addr, error = %e, "TLS handshake failed"); }
-                                Ok(tls_stream) => {
-                                    info!(addr = %addr, "TLS client connected");
-                                    let handle = spawn_tls_client_task(tls_stream, addr, timeout).await;
-                                    let _ = clients_tx.send(handle).await;
-                                }
-                            }
-                        });
-                        client_count += 1;
-                    }
-                }
-            }
-            _ = shutdown.recv() => {
-                info!("TLS transport shutting down");
-                break;
-            }
+    fn cfg(dir: &std::path::Path) -> TlsTransportConfig {
+        crate::certgen::generate_cert(dir, "localhost", 1).unwrap();
+        TlsTransportConfig {
+            cert: dir.join("cert.pem").display().to_string(),
+            key: dir.join("key.pem").display().to_string(),
+            ..Default::default()
         }
     }
-    Ok(())
-}
 
-async fn spawn_tls_client_task(
-    stream: tokio_rustls::server::TlsStream<TcpStream>,
-    addr: SocketAddr,
-    write_timeout: Duration,
-) -> ClientHandle {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[test]
+    fn loads_generated_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(server_config(&cfg(dir.path())).is_ok());
+    }
 
-    let id = Uuid::new_v4();
-    let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(256);
-    let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
+    #[test]
+    fn mutual_tls_with_ca_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        c.client_ca = Some(c.cert.clone());
+        assert!(server_config(&c).is_ok());
+    }
 
-    tokio::spawn(async move {
-        let (mut reader, mut writer) = tokio::io::split(stream);
-        let mut buf = [0u8; 4096];
-
-        loop {
-            tokio::select! {
-                data = out_rx.recv() => {
-                    match data {
-                        None => break,
-                        Some(bytes) => {
-                            let res = tokio::time::timeout(write_timeout, writer.write_all(&bytes)).await;
-                            if res.is_err() || res.unwrap().is_err() {
-                                warn!(addr = %addr, "TLS write failed");
-                                break;
-                            }
-                        }
-                    }
-                }
-                read = reader.read(&mut buf) => {
-                    match read {
-                        Err(e) => { debug!(addr = %addr, error = %e, "TLS read error"); break; }
-                        Ok(0) => { debug!(addr = %addr, "TLS client disconnected"); break; }
-                        Ok(n) => {
-                            let data = Bytes::copy_from_slice(&buf[..n]);
-                            if in_tx.send(data).await.is_err() { break; }
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    ClientHandle { id, addr, tx: out_tx, rx: in_rx }
+    #[test]
+    fn missing_or_empty_files_are_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path());
+        std::fs::write(dir.path().join("empty.pem"), "").unwrap();
+        c.key = dir.path().join("empty.pem").display().to_string();
+        assert!(server_config(&c).is_err());
+        c.cert = "/nonexistent/cert.pem".into();
+        assert!(server_config(&c).is_err());
+    }
 }

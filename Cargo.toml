@@ -1,101 +1,68 @@
 [package]
 name = "io-to-net"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
-description = "Universal hardware IO bridge — exposes local hardware interfaces over TCP/IP"
-license = "GPL-3.0"
-repository = "https://github.com/io-to-net/io-to-net"
-keywords = ["serial", "bridge", "hardware", "tcp", "iot"]
-categories = ["network-programming", "hardware-support"]
+rust-version = "1.89"
+authors = ["askrejans"]
+description = "Transparent edge bridge: serial, CAN, I2C, GPIO, BLE and more to TCP, TLS and WebSocket clients"
+license = "GPL-3.0-only"
+repository = "https://github.com/askrejans/io-to-net"
+readme = "README.md"
+keywords = ["serial", "bridge", "tcp", "can", "telemetry"]
+categories = ["network-programming", "hardware-support", "command-line-utilities"]
 
 [[bin]]
 name = "io-to-net"
 path = "src/main.rs"
 
 [features]
-default = []
-# Enable Linux-specific hardware drivers
-linux-drivers = []
+default = ["bluetooth"]
+# BLE GATT sources (btleplug; needs D-Bus on Linux)
+bluetooth = ["dep:btleplug"]
 
 [dependencies]
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-async-trait = "0.1"
-futures = "0.3"
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "sync", "fs"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8"
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
-# CLI
-clap = { version = "4", features = ["derive", "env"] }
+# sysfs enumeration on Linux (USB IDs included), so no libudev dependency
+serialport = { version = "4.10.1", default-features = false }
 
-# Serialisation / config
-serde = { version = "1", features = ["derive"] }
-toml = "0.9.8"
-serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+rcgen = "0.14.10"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
-# Error handling
-anyhow = "1"
-thiserror = "2.0.18"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 
-# Serial port
-serialport = "4.8.1"
+ratatui = "0.30.2"
 
-# TLS
-rustls = { version = "0.23", features = ["ring"] }
-tokio-rustls = "0.26"
-rustls-pemfile = "2"
-rcgen = "0.14.7"
+btleplug = { version = "0.13.5", optional = true }
 
-# WebSocket
-tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }
-
-# HTTP admin API
-axum = { version = "0.8.8", features = ["json"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
-hyper = { version = "1", features = ["full"] }
-
-# Prometheus metrics
-prometheus = { version = "0.14.0", features = ["process"] }
-
-# TUI
-ratatui = "0.30.0"
-crossterm = "0.29.0"
-
-# Logging / observability
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# Utilities
-bytes = "1"
-parking_lot = "0.12"
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
-once_cell = "1"
-regex = "1"
-
-# Bluetooth / BLE
-btleplug = "0.11"
-
-# Unix / platform
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.2", features = ["ioctl", "fs", "term", "process", "signal"] }
+nix = { version = "0.31.3", features = ["term", "fs", "signal", "poll"] }
 
-# Linux-specific hardware drivers
 [target.'cfg(target_os = "linux")'.dependencies]
-i2cdev = "0.6"
-gpio-cdev = "0.6"
-socketcan = "3"
-libc = "0.2.183"
+i2cdev = "0.6.2"
+gpio-cdev = "0.6.0"
+socketcan = "4.0.0"
+libc = "0.2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full", "test-util"] }
-tempfile = "3"
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
 
 [profile.release]
-opt-level = 3
-lto = true
+lto = "thin"
 codegen-units = 1
 strip = true
-
-[profile.dev]
-opt-level = 0
-debug = true

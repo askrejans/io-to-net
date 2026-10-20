@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#08090a">
+  <title>io-to-net</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="app.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="bar">
+    <div class="brand"><span class="name">io-to-net</span><span class="ver" id="version">—</span></div>
+    <div class="lamps" aria-label="Status">
+      <span class="lamp" id="lamp-sources" title="All sources open"><i></i>Sources</span>
+      <span class="lamp" id="lamp-clients" title="Clients connected"><i></i>Clients</span>
+      <span class="lamp" id="lamp-link" title="Dashboard data stream"><i></i>Live</span>
+    </div>
+    <div class="clock"><span class="lbl">Uptime</span><b id="uptime">—</b></div>
+  </header>
+
+  <section class="panel readout" aria-label="Totals">
+    <div class="cell"><span class="lbl">Sources open</span><span class="val"><b id="r-open">—</b><small id="r-open-of"></small></span><span class="sub" id="r-open-sub">&nbsp;</span></div>
+    <div class="cell"><span class="lbl">Clients</span><span class="val"><b id="r-clients">—</b></span><span class="sub" id="r-clients-sub">&nbsp;</span></div>
+    <div class="cell"><span class="lbl">From devices</span><span class="val"><b id="r-rx">—</b><small id="r-rx-u">B/s</small></span><span class="sub" id="r-rx-sub">&nbsp;</span></div>
+    <div class="cell"><span class="lbl">To devices</span><span class="val"><b id="r-tx">—</b><small id="r-tx-u">B/s</small></span><span class="sub" id="r-tx-sub">&nbsp;</span></div>
+    <div class="cell"><span class="lbl">Problems</span><span class="val"><b id="r-err">—</b></span><span class="sub" id="r-err-sub">&nbsp;</span></div>
+  </section>
+
+  <nav class="keys" aria-label="Mode">
+    <button class="key" data-mode="bridges"><i class="led"></i>Bridges</button>
+    <button class="key" data-mode="monitor"><i class="led"></i>Monitor</button>
+    <button class="key" data-mode="clients"><i class="led"></i>Clients</button>
+    <button class="key" data-mode="ports"><i class="led"></i>Ports</button>
+    <button class="key" data-mode="logs"><i class="led"></i>Logs</button>
+    <button class="key" data-mode="config"><i class="led"></i>Configuration</button>
+    <span class="spacer"></span>
+    <span class="keygrp">
+      <button class="key small" id="k-theme" title="Light or dark theme"><i class="led on"></i><span id="k-theme-t">Dark</span></button>
+    </span>
+  </nav>
+
+  <main>
+    <section class="mode" id="mode-bridges" hidden>
+      <div class="grid g-bridges" id="bridges"></div>
+    </section>
+
+    <section class="mode" id="mode-monitor" hidden>
+      <article class="panel">
+        <h2>Traffic monitor <span class="note" id="mon-note">last 200 reads and writes</span></h2>
+        <div class="actions top" id="mon-bridges"></div>
+        <div class="actions top">
+          <button class="key small" id="k-mon-pause"><i class="led"></i><span>Pause</span></button>
+          <button class="key small" id="k-mon-ascii"><i class="led"></i>ASCII</button>
+          <button class="key small" id="k-mon-clear"><i class="led"></i>Clear</button>
+        </div>
+        <div class="table-wrap"><table class="tbl hex" id="mon-table">
+          <thead><tr><th>Time</th><th>Dir</th><th class="n">Bytes</th><th>Data</th></tr></thead><tbody></tbody>
+        </table></div>
+      </article>
+    </section>
+
+    <section class="mode" id="mode-clients" hidden>
+      <article class="panel">
+        <h2>Connected clients</h2>
+        <div class="table-wrap"><table class="tbl" id="clients-table">
+          <thead><tr><th>Bridge</th><th>Client</th><th class="n">Connected</th><th class="n">Sent</th><th class="n">Received</th></tr></thead><tbody></tbody>
+        </table></div>
+      </article>
+    </section>
+
+    <section class="mode" id="mode-ports" hidden>
+      <article class="panel">
+        <h2>Serial ports <span class="note">a USB selector finds the device again after re-plugging</span></h2>
+        <div class="actions top"><button class="key small" id="k-ports"><i class="led"></i>Rescan</button></div>
+        <div class="table-wrap"><table class="tbl" id="ports-table">
+          <thead><tr><th>Path</th><th>Type</th><th>Device</th><th>Selector</th><th></th></tr></thead><tbody></tbody>
+        </table></div>
+      </article>
+    </section>
+
+    <section class="mode" id="mode-logs" hidden>
+      <article class="panel">
+        <h2>Log <span class="note">newest first</span></h2>
+        <div class="actions top"><input class="filter" id="log-filter" type="search" placeholder="Filter" aria-label="Filter log"></div>
+        <ul class="log" id="log"></ul>
+      </article>
+    </section>
+
+    <section class="mode" id="mode-config" hidden>
+      <div class="grid g-cfg">
+        <article class="panel">
+          <h2>Configuration file</h2>
+          <dl class="kv" id="cfg-file"></dl>
+          <div class="actions"><button class="key" id="k-reload"><i class="led"></i>Reload</button></div>
+          <p class="sub" id="reload-result">&nbsp;</p>
+          <h2>Endpoints</h2>
+          <ul class="links" id="cfg-endpoints"></ul>
+        </article>
+        <article class="panel">
+          <h2>Effective configuration <span class="note">read-only · tokens masked · edit the file, then reload</span></h2>
+          <div class="cfg" id="cfg-groups"></div>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="auth">
+    <form method="dialog" class="panel">
+      <h2>Access token required</h2>
+      <p>This instance protects its API with <code>[http_api.auth]</code>. The token is kept in this browser only.</p>
+      <input id="auth-token" type="password" autocomplete="current-password" placeholder="Bearer token" required>
+      <div class="actions"><button class="key" value="ok"><i class="led on"></i>Connect</button></div>
+    </form>
+  </dialog>
+
+  <footer class="foot"><span id="foot-config">—</span><span id="foot-time"></span></footer>
+</body>
+</html>

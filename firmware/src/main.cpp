@@ -12,13 +12,10 @@ WiFiManager wifiManager;
 
 #ifdef ENABLE_UART_BRIDGE
 TcpBridge  uartTcpBridge(UART_TCP_PORT, "uart");
-// Use Serial2 for data on ESP32 (GPIO16 RX / GPIO17 TX)
-// On ESP8266 we use Serial1 (TX only) or swapped SoftwareSerial — use Serial by default
 #ifdef ARDUINO_ARCH_ESP32
-  UartBridge uartBridge(Serial2, uartTcpBridge);
+  UartBridge uartBridge(Serial2, uartTcpBridge);  // pins from config.h
 #else
-  // ESP8266: Serial is used for debug, so we re-use it here (change to SoftwareSerial if needed)
-  UartBridge uartBridge(Serial, uartTcpBridge);
+  UartBridge uartBridge(Serial, uartTcpBridge);   // UART0; debug is on Serial1
 #endif
 #endif
 
@@ -38,7 +35,7 @@ void setup() {
     // Debug serial
     DEBUG_SERIAL.begin(DEBUG_BAUD);
     delay(200);
-    DEBUG_SERIAL.printf("\n\nio-to-net firmware v0.1.0\n");
+    DEBUG_SERIAL.printf("\n\nio-to-net firmware v%s\n", FIRMWARE_VERSION);
     DEBUG_SERIAL.printf("Build: %s %s\n", __DATE__, __TIME__);
 
 #if STATUS_LED_PIN != -1

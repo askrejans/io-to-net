@@ -1,3 +1,5 @@
+// Only Linux drivers and BLE use the polled path.
+#![cfg_attr(not(any(target_os = "linux", feature = "bluetooth")), allow(dead_code))]
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -52,7 +54,10 @@ mod tests {
     #[test]
     fn error_display_platform() {
         let e = IoToNetError::PlatformNotSupported("I2C requires Linux".into());
-        assert_eq!(format!("{}", e), "Not supported on this platform: I2C requires Linux");
+        assert_eq!(
+            format!("{}", e),
+            "Not supported on this platform: I2C requires Linux"
+        );
     }
 
     #[test]

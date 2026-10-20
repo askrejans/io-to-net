@@ -1,40 +1,90 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use tracing::debug;
+use anyhow::{Context, Result, bail};
 
-use super::schema::AppConfig;
+use super::schema::{AppConfig, SourceConfig, TransportConfig};
 
-/// Load application configuration from a TOML file.
+/// Config locations tried when no path is given, in order.
+pub const SEARCH_PATHS: &[&str] = &["config.toml", "/etc/io-to-net/config.toml"];
+
+pub fn resolve_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p.to_path_buf());
+    }
+    for p in SEARCH_PATHS {
+        if Path::new(p).exists() {
+            return Ok(PathBuf::from(p));
+        }
+    }
+    bail!(
+        "no config file found (tried {}); pass --config <path>",
+        SEARCH_PATHS.join(", ")
+    )
+}
+
 pub fn load_config(path: &Path) -> Result<AppConfig> {
     let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Cannot read config file: {}", path.display()))?;
-
-    let cfg: AppConfig = toml::from_str(&content)
-        .with_context(|| format!("Invalid TOML in config file: {}", path.display()))?;
-
-    validate_config(&cfg)?;
-    debug!(bridges = cfg.bridges.len(), "Configuration loaded");
+        .with_context(|| format!("cannot read config file {}", path.display()))?;
+    let cfg: AppConfig =
+        toml::from_str(&content).with_context(|| format!("invalid config {}", path.display()))?;
+    validate(&cfg)?;
     Ok(cfg)
 }
 
-/// Reload configuration from the same path (used for live-reload via SIGHUP).
-#[allow(dead_code)]
-pub fn reload_config(path: &Path) -> Result<AppConfig> {
-    load_config(path)
-}
-
-fn validate_config(cfg: &AppConfig) -> Result<()> {
-    if cfg.bridges.is_empty() {
-        tracing::warn!("No bridges configured — io-to-net will run but forward no data");
-    }
-
-    for bridge in &cfg.bridges {
-        if bridge.name.is_empty() {
-            anyhow::bail!("Bridge name must not be empty");
+pub fn validate(cfg: &AppConfig) -> Result<()> {
+    let mut names = HashSet::new();
+    let mut listens = HashSet::new();
+    for b in &cfg.bridges {
+        if b.name.trim().is_empty() {
+            bail!("bridge name must not be empty");
+        }
+        if !b
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        {
+            bail!(
+                "bridge name {:?}: use letters, digits, '-', '_' or '.'",
+                b.name
+            );
+        }
+        if !names.insert(b.name.as_str()) {
+            bail!("duplicate bridge name {:?}", b.name);
+        }
+        if !listens.insert(b.transport.listen().to_string()) {
+            bail!("bridges share the listen address {}", b.transport.listen());
+        }
+        if b.max_clients == Some(0) {
+            bail!("bridge {:?}: max_clients must be at least 1", b.name);
+        }
+        if b.auth.as_ref().is_some_and(|a| a.token.trim().is_empty()) {
+            bail!("bridge {:?}: auth.token must not be empty", b.name);
+        }
+        if let SourceConfig::Serial(s) = &b.source {
+            if s.baud == 0 {
+                bail!("bridge {:?}: baud must be greater than 0", b.name);
+            }
+            if !(5..=8).contains(&s.data_bits) || !(1..=2).contains(&s.stop_bits) {
+                bail!("bridge {:?}: data_bits 5–8 and stop_bits 1–2", b.name);
+            }
+            if s.port.starts_with("usb:") {
+                crate::link::serial::Selector::parse(&s.port)
+                    .with_context(|| format!("bridge {:?}", b.name))?;
+            }
+        }
+        if let TransportConfig::Tls(t) = &b.transport
+            && (t.cert.is_empty() || t.key.is_empty())
+        {
+            bail!("bridge {:?}: tls needs cert and key", b.name);
         }
     }
-
+    if let Some(api) = &cfg.http_api
+        && api.enabled
+        && api.auth.as_ref().is_some_and(|a| a.token.trim().is_empty())
+    {
+        bail!("http_api.auth.token must not be empty");
+    }
     Ok(())
 }
 
@@ -42,145 +92,95 @@ fn validate_config(cfg: &AppConfig) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+
+    fn load(src: &str) -> Result<AppConfig> {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        load_config(f.path())
+    }
+
+    const EXAMPLE: &str = include_str!("../../config/example.toml");
 
     #[test]
-    fn test_load_minimal_config() {
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, r#"
-log_level = "debug"
-
-[[bridges]]
-name = "ecu"
-
-[bridges.source]
-type = "serial"
-port = "/dev/ttyUSB0"
-baud = 115200
-
-[bridges.transport]
-type = "tcp"
-listen = "[::]:9000"
-"#).unwrap();
-
-        let cfg = load_config(f.path()).unwrap();
+    fn shipped_example_is_valid() {
+        let cfg = load(EXAMPLE).unwrap();
         assert_eq!(cfg.bridges.len(), 1);
+    }
+
+    /// Every commented-out example block, uncommented, is valid too.
+    #[test]
+    fn every_example_block_is_valid() {
+        let all: String = EXAMPLE
+            .lines()
+            .map(|l| match l.strip_prefix("# ") {
+                Some(rest)
+                    if rest.starts_with('[')
+                        || rest.split_once(" = ").is_some_and(|(k, _)| {
+                            k.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                        }) =>
+                {
+                    rest
+                }
+                _ => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cfg = load(&all).unwrap();
+        let kinds: Vec<_> = cfg.bridges.iter().map(|b| b.source.kind()).collect();
+        assert_eq!(
+            kinds,
+            ["serial", "serial", "tcp_client", "tcp_client", "canbus", "i2c", "gpio", "onewire", "bluetooth", "pty", "unix_socket"]
+        );
+        assert!(cfg.metrics.is_some() && cfg.http_api.unwrap().auth.is_some());
+    }
+
+    const ECU: &str = "[[bridges]]\nname = \"ecu\"\n[bridges.source]\ntype = \"serial\"\nport = \"/dev/ttyUSB0\"\n[bridges.transport]\ntype = \"tcp\"\nlisten = \"[::]:9000\"\n";
+
+    #[test]
+    fn loads_a_minimal_bridge() {
+        let cfg = load(ECU).unwrap();
         assert_eq!(cfg.bridges[0].name, "ecu");
     }
 
     #[test]
-    fn test_load_empty_bridges() {
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, r#"log_level = "info""#).unwrap();
-        let cfg = load_config(f.path()).unwrap();
-        assert!(cfg.bridges.is_empty());
+    fn empty_file_is_valid() {
+        assert!(load("").unwrap().bridges.is_empty());
     }
 
     #[test]
-    fn test_file_not_found() {
-        let err = load_config(std::path::Path::new("/nonexistent/path/config.toml"));
-        assert!(err.is_err());
-        let msg = format!("{}", err.unwrap_err());
-        assert!(msg.contains("Cannot read config file"));
+    fn rejects_bad_files_with_a_reason() {
+        let cases = [
+            ("not toml ===", "invalid config"),
+            (
+                &ECU.replace("name = \"ecu\"", "name = \"\""),
+                "must not be empty",
+            ),
+            (
+                &format!(
+                    "{ECU}{}",
+                    ECU.replace("listen = \"[::]:9000\"", "listen = \"[::]:9001\"")
+                ),
+                "duplicate bridge name",
+            ),
+            (
+                &format!("{ECU}{}", ECU.replace("\"ecu\"", "\"ecu2\"")),
+                "share the listen address",
+            ),
+            (&ECU.replace("/dev/ttyUSB0", "usb:zz:1"), "VID"),
+            (
+                &ECU.replace("name = \"ecu\"", "name = \"ecu\"\nmax_clients = 0"),
+                "max_clients",
+            ),
+        ];
+        for (src, want) in cases {
+            let err = format!("{:#}", load(src).unwrap_err());
+            assert!(err.contains(want), "{want:?} not in {err:?}");
+        }
     }
 
     #[test]
-    fn test_invalid_toml_returns_error() {
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "this is not valid toml ====").unwrap();
-        let err = load_config(f.path());
-        assert!(err.is_err());
-        let msg = format!("{}", err.unwrap_err());
-        assert!(msg.contains("Invalid TOML"));
-    }
-
-    #[test]
-    fn test_bridge_empty_name_rejected() {
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, r#"
-[[bridges]]
-name = ""
-
-[bridges.source]
-type = "serial"
-port = "/dev/ttyUSB0"
-
-[bridges.transport]
-type = "tcp"
-listen = "[::]:9000"
-"#).unwrap();
-        let err = load_config(f.path());
-        assert!(err.is_err());
-        let msg = format!("{}", err.unwrap_err());
-        assert!(msg.contains("Bridge name must not be empty"));
-    }
-
-    #[test]
-    fn test_reload_returns_same_config() {
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, r#"
-log_level = "debug"
-
-[[bridges]]
-name = "ecu"
-
-[bridges.source]
-type = "serial"
-port = "/dev/ttyUSB0"
-baud = 115200
-
-[bridges.transport]
-type = "tcp"
-listen = "[::]:9000"
-"#).unwrap();
-        let c1 = load_config(f.path()).unwrap();
-        let c2 = reload_config(f.path()).unwrap();
-        assert_eq!(c1.bridges[0].name, c2.bridges[0].name);
-        assert_eq!(c1.log_level, c2.log_level);
-    }
-
-    #[test]
-    fn test_multiple_bridges() {
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, r#"
-[[bridges]]
-name = "a"
-[bridges.source]
-type = "serial"
-port = "/dev/ttyUSB0"
-[bridges.transport]
-type = "tcp"
-listen = "[::]:9000"
-
-[[bridges]]
-name = "b"
-[bridges.source]
-type = "pty"
-[bridges.transport]
-type = "tcp"
-listen = "[::]:9001"
-"#).unwrap();
-        let cfg = load_config(f.path()).unwrap();
-        assert_eq!(cfg.bridges.len(), 2);
-        assert_eq!(cfg.bridges[0].name, "a");
-        assert_eq!(cfg.bridges[1].name, "b");
-    }
-
-    #[test]
-    fn test_http_api_config_loaded() {
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, r#"
-[http_api]
-enabled = true
-listen = "127.0.0.1:9106"
-
-[http_api.auth]
-token = "mysecret"
-"#).unwrap();
-        let cfg = load_config(f.path()).unwrap();
-        let api = cfg.http_api.unwrap();
-        assert!(api.enabled);
-        assert_eq!(api.listen, "127.0.0.1:9106");
-        assert_eq!(api.auth.unwrap().token, "mysecret");
+    fn missing_file_names_the_path() {
+        let err = load_config(Path::new("/nonexistent/io.toml")).unwrap_err();
+        assert!(format!("{err:#}").contains("/nonexistent/io.toml"));
     }
 }

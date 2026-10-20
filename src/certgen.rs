@@ -22,8 +22,10 @@ pub fn generate_cert(out_dir: &Path, cn: &str, days: u32) -> Result<()> {
 
     // Subject alternative names
     params.subject_alt_names = vec![
-        SanType::DnsName(cn.try_into()
-            .unwrap_or_else(|_| "io-to-net".try_into().unwrap())),
+        SanType::DnsName(
+            cn.try_into()
+                .unwrap_or_else(|_| "io-to-net".try_into().unwrap()),
+        ),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         SanType::IpAddress(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
     ];
@@ -32,16 +34,9 @@ pub fn generate_cert(out_dir: &Path, cn: &str, days: u32) -> Result<()> {
     let now = chrono::Utc::now();
     let future = now + chrono::Duration::days(days as i64);
 
-    params.not_before = rcgen::date_time_ymd(
-        now.year(),
-        now.month() as u8,
-        now.day() as u8,
-    );
-    params.not_after = rcgen::date_time_ymd(
-        future.year(),
-        future.month() as u8,
-        future.day() as u8,
-    );
+    params.not_before = rcgen::date_time_ymd(now.year(), now.month() as u8, now.day() as u8);
+    params.not_after =
+        rcgen::date_time_ymd(future.year(), future.month() as u8, future.day() as u8);
 
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
 

@@ -85,4 +85,3 @@ pub async fn scan_bluetooth_timed(duration: Duration, deep: bool) -> Vec<(String
 pub async fn scan_bluetooth() -> Vec<(String, String)> {
     scan_bluetooth_timed(Duration::from_secs(5), false).await
 }
-

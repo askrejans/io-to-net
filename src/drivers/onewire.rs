@@ -1,77 +1,56 @@
-#![allow(dead_code)]
+//! 1-Wire sensors through the Linux w1 sysfs interface: the `w1_slave` text
+//! every `poll_ms`.
 
-use async_trait::async_trait;
 #[cfg(target_os = "linux")]
-use tracing::debug;
+pub use linux::OnewireDriver;
 
-use crate::config::OnewireConfig;
-use crate::error::{IoToNetError, Result};
+#[cfg(target_os = "linux")]
+mod linux {
+    use crate::config::OnewireConfig;
+    use crate::drivers::IoDriver;
+    use crate::error::{IoToNetError, Result};
+    use std::path::PathBuf;
 
-use super::IoDriver;
-
-/// 1-Wire bus driver — reads the Linux sysfs w1_slave file periodically.
-/// Typically used for DS18B20 temperature sensors.
-pub struct OnewireDriver {
-    cfg: OnewireConfig,
-}
-
-impl OnewireDriver {
-    pub fn new(cfg: OnewireConfig) -> Self {
-        OnewireDriver { cfg }
+    pub struct OnewireDriver {
+        cfg: OnewireConfig,
     }
 
-    fn sysfs_path(&self) -> std::path::PathBuf {
-        std::path::Path::new(&self.cfg.device).join("w1_slave")
+    impl OnewireDriver {
+        pub fn new(cfg: OnewireConfig) -> Self {
+            OnewireDriver { cfg }
+        }
+        fn path(&self) -> PathBuf {
+            PathBuf::from(&self.cfg.device).join("w1_slave")
+        }
     }
-}
 
-#[async_trait]
-impl IoDriver for OnewireDriver {
-    async fn open(&mut self) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            let path = self.sysfs_path();
-            if !path.exists() {
+    impl IoDriver for OnewireDriver {
+        async fn open(&mut self) -> Result<()> {
+            if !self.path().exists() {
                 return Err(IoToNetError::Driver(format!(
                     "1-Wire device not found: {}",
-                    path.display()
+                    self.path().display()
                 )));
             }
-            debug!(device = %self.cfg.device, "1-Wire device opened");
             Ok(())
         }
-        #[cfg(not(target_os = "linux"))]
-        Err(IoToNetError::PlatformNotSupported("1-Wire requires Linux".to_string()))
-    }
 
-    async fn read(&mut self, _buf: &mut [u8]) -> Result<usize> {
-        #[cfg(target_os = "linux")]
-        {
-            let path = self.sysfs_path();
-            let content = tokio::fs::read_to_string(&path)
-                .await
-                .map_err(|e| IoToNetError::Driver(format!("1-Wire read {}: {}", path.display(), e)))?;
-
-            let bytes = content.as_bytes();
-            let len = bytes.len().min(_buf.len());
-            _buf[..len].copy_from_slice(&bytes[..len]);
-
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
             tokio::time::sleep(std::time::Duration::from_millis(self.cfg.poll_ms)).await;
-            Ok(len)
+            let text = tokio::fs::read(self.path()).await.map_err(|e| {
+                IoToNetError::Driver(format!("1-Wire {}: {e}", self.path().display()))
+            })?;
+            let n = text.len().min(buf.len());
+            buf[..n].copy_from_slice(&text[..n]);
+            Ok(n)
         }
-        #[cfg(not(target_os = "linux"))]
-        Err(IoToNetError::PlatformNotSupported("1-Wire requires Linux".to_string()))
-    }
 
-    async fn write(&mut self, _data: &[u8]) -> Result<usize> {
-        Err(IoToNetError::Driver("1-Wire is read-only".to_string()))
-    }
+        async fn write(&mut self, _data: &[u8]) -> Result<usize> {
+            Err(IoToNetError::Driver("1-Wire sources are read-only".into()))
+        }
 
-    async fn close(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn description(&self) -> String {
-        format!("onewire://{}", self.cfg.device)
+        fn description(&self) -> String {
+            format!("onewire://{}", self.cfg.device)
+        }
     }
 }

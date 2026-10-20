@@ -1,12 +1,10 @@
-use std::collections::VecDeque;
-use std::io::Write;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use parking_lot::RwLock;
-use tokio::signal;
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 mod api;
@@ -15,72 +13,58 @@ mod config;
 mod core;
 mod drivers;
 mod error;
+mod link;
 mod protocol;
 mod scan;
 mod transports;
 mod tui;
 
-use config::loader::load_config;
-use core::bridge_manager::BridgeManager;
-use core::metrics::GlobalMetrics;
-
-/// Resolve the config file path.
-///
-/// If the user supplied an explicit `--config` value (i.e. it differs from the
-/// compiled-in default), use it directly.  Otherwise try, in order:
-///   1. `./config.toml`          — current working directory
-///   2. `/etc/io-to-net/config.toml` — system-wide default
-fn resolve_config_path(cli_path: &PathBuf) -> anyhow::Result<PathBuf> {
-    const DEFAULT: &str = "/etc/io-to-net/config.toml";
-
-    // Explicit path supplied by the user — honour it exactly.
-    if cli_path != &PathBuf::from(DEFAULT) {
-        return Ok(cli_path.clone());
-    }
-
-    let candidates: &[&str] = &["config.toml", DEFAULT];
-    for p in candidates {
-        if std::path::Path::new(p).exists() {
-            return Ok(PathBuf::from(p));
-        }
-    }
-
-    anyhow::bail!(
-        "No config file found. Tried:\n  {}\n\nCreate one or pass --config <path>.",
-        candidates.join("\n  ")
-    )
-}
+use crate::config::loader::{load_config, resolve_path};
+use crate::core::manager::{self, Manager};
+use crate::core::stats::Registry;
 
 #[derive(Parser)]
 #[command(
     name = "io-to-net",
-    about = "Universal hardware IO bridge — exposes local hardware interfaces over TCP/IP",
-    version
+    version,
+    about = "Transparent bridge from serial, CAN, I2C, GPIO, BLE and more to TCP, TLS and WebSocket clients"
 )]
 struct Cli {
-    /// Path to configuration file
-    #[arg(short, long, default_value = "/etc/io-to-net/config.toml", env = "IO_TO_NET_CONFIG")]
-    config: PathBuf,
+    /// Config file (default: ./config.toml, then /etc/io-to-net/config.toml)
+    #[arg(short, long, env = "IO_TO_NET_CONFIG")]
+    config: Option<PathBuf>,
 
-    /// Run as a background daemon (no TUI)
-    #[arg(short, long)]
-    daemon: bool,
+    /// No terminal UI; log to stdout (also when stdout is not a terminal)
+    #[arg(long, visible_alias = "daemon", short = 'd')]
+    headless: bool,
 
-    /// Scan system for available hardware devices and exit
+    /// Log as JSON lines (headless only)
+    #[arg(long)]
+    log_json: bool,
+
+    /// trace, debug, info, warn or error (overrides log_level in the config)
+    #[arg(short, long, env = "IO_TO_NET_LOG_LEVEL")]
+    log_level: Option<String>,
+
+    /// List serial ports (with USB selectors), I2C buses, GPIO chips and BLE devices
     #[arg(short, long)]
     scan: bool,
 
-    /// Deep scan: BLE service discovery, I2C address probing (slower)
+    /// With --scan: probe I2C buses and discover BLE services (slower)
     #[arg(long, requires = "scan")]
     deep: bool,
 
-    /// Output scan results as JSON
+    /// With --scan: print JSON
     #[arg(long, requires = "scan")]
     json: bool,
 
-    /// Override log level (trace, debug, info, warn, error)
-    #[arg(short, long, env = "IO_TO_NET_LOG_LEVEL")]
-    log_level: Option<String>,
+    /// Validate the configuration and exit
+    #[arg(long)]
+    check_config: bool,
+
+    /// Query the running instance's /health and exit 0 when every source is open
+    #[arg(long)]
+    healthcheck: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -93,11 +77,9 @@ enum Commands {
         /// Output directory for cert.pem and key.pem
         #[arg(short, long, default_value = ".")]
         out: PathBuf,
-
-        /// Common name (domain / hostname) for the certificate
+        /// Common name (host name) for the certificate
         #[arg(long, default_value = "io-to-net")]
         cn: String,
-
         /// Validity in days
         #[arg(long, default_value_t = 365)]
         days: u32,
@@ -105,188 +87,243 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-
-    // Handle subcommands before any config loading
-    if let Some(Commands::GenerateCert { out, cn, days }) = cli.command {
-        certgen::generate_cert(&out, &cn, days)?;
-        return Ok(());
+async fn main() {
+    if let Err(e) = run(Cli::parse()).await {
+        eprintln!("io-to-net: {e:#}");
+        std::process::exit(1);
     }
+}
 
-    // Initialise logging
-    let log_level = cli
-        .log_level
-        .clone()
-        .unwrap_or_else(|| "info".to_string());
-
-    // Device scan mode: plain stdout logging, no ring buffer needed.
+async fn run(cli: Cli) -> Result<()> {
+    if let Some(Commands::GenerateCert { out, cn, days }) = cli.command {
+        return certgen::generate_cert(&out, &cn, days);
+    }
     if cli.scan {
-        init_logging(&log_level, true, None);
+        init_logging(
+            None,
+            cli.log_level.as_deref().unwrap_or("warn"),
+            true,
+            false,
+        );
         scan::run_scan(cli.deep, cli.json).await;
         return Ok(());
     }
 
-    // Shared log ring-buffer — created before init_logging so TUI mode can
-    // route all tracing output into it instead of writing to stdout.
-    let log_buffer: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>> =
-        Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(1000)));
+    let path = resolve_path(cli.config.as_deref())?;
+    let cfg = load_config(&path)?;
+    let api_cfg = cfg.http_api.clone().unwrap_or_default();
 
-    // In TUI mode pass the ring-buffer so tracing writes there, not stdout.
-    init_logging(
-        &log_level,
-        cli.daemon,
-        if cli.daemon { None } else { Some(log_buffer.clone()) },
-    );
-
-    // Load configuration
-    let config_path = resolve_config_path(&cli.config)?;
-    let cfg = load_config(&config_path)
-        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
-
-    info!(version = env!("CARGO_PKG_VERSION"), "io-to-net starting");
-
-    // Shared metrics
-    let metrics = Arc::new(RwLock::new(GlobalMetrics::new()));
-
-    // Bridge manager
-    let mut bridge_manager = BridgeManager::new(cfg.clone(), metrics.clone(), log_buffer.clone());
-
-    // Start all bridges
-    bridge_manager.start_all().await?;
-
-    // Start HTTP admin API if enabled
-    if cfg.http_api.as_ref().map_or(false, |a| a.enabled) {
-        let api_cfg = cfg.http_api.clone().unwrap();
-        let metrics_clone = metrics.clone();
-        let log_buffer_clone = log_buffer.clone();
-        let bridge_manager_handle = bridge_manager.get_handle();
-        tokio::spawn(async move {
-            if let Err(e) = api::http::serve(api_cfg, metrics_clone, log_buffer_clone, bridge_manager_handle).await {
-                error!(error = %e, "HTTP API server failed");
-            }
-        });
-    }
-
-    // Start Prometheus metrics endpoint if enabled
-    if cfg.metrics.as_ref().map_or(false, |m| m.enabled) {
-        let metrics_cfg = cfg.metrics.clone().unwrap();
-        let metrics_clone = metrics.clone();
-        tokio::spawn(async move {
-            if let Err(e) = api::prometheus::serve(metrics_cfg, metrics_clone).await {
-                error!(error = %e, "Prometheus metrics server failed");
-            }
-        });
-    }
-
-    if cli.daemon {
-        // Daemon mode: wait for shutdown signal
-        info!("Running in daemon mode");
-        wait_for_shutdown().await;
-    } else {
-        // Interactive TUI mode
-        let tui_result = tui::app::run(metrics.clone(), log_buffer.clone(), bridge_manager.get_handle()).await;
-        // After TUI exits, clean up
-        match tui_result {
-            Ok(_) => info!("TUI exited normally"),
-            Err(e) => warn!(error = %e, "TUI exited with error"),
+    if cli.check_config {
+        println!("{}: OK, {} bridge(s)", path.display(), cfg.bridges.len());
+        for b in &cfg.bridges {
+            println!(
+                "  {:<16} {} → {} {}",
+                b.name,
+                b.source.describe(),
+                b.transport.kind(),
+                b.transport.listen()
+            );
         }
+        return Ok(());
+    }
+    if cli.healthcheck {
+        return healthcheck(&api_cfg.listen).await;
     }
 
-    info!("Shutting down bridges");
-    bridge_manager.stop_all().await;
+    let tui = !cli.headless && std::io::stdout().is_terminal();
+    let reg = Registry::new();
+    init_logging(
+        Some(reg.clone()),
+        cli.log_level.as_deref().unwrap_or(&cfg.log_level),
+        !tui,
+        cli.log_json,
+    );
+    *reg.config_path.lock().unwrap() = Some(path.display().to_string());
+    *reg.config.lock().unwrap() = config::masked(&cfg);
+
+    info!(version = env!("CARGO_PKG_VERSION"), config = %path.display(), "io-to-net starting");
+    if cfg.bridges.is_empty() {
+        warn!("no bridges configured; add [[bridges]] and reload (SIGHUP or POST /api/v1/reload)");
+    }
+
+    let mut mgr = Manager::new(reg.clone());
+    mgr.apply(&cfg.bridges).await;
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let stopped = |mut rx: watch::Receiver<bool>| async move {
+        let _ = rx.wait_for(|v| *v).await;
+    };
+    let (control, mgr_task) = manager::spawn(mgr, path, stopped(stop_rx.clone()));
+
+    if api_cfg.enabled {
+        let (reg, control, stop) = (reg.clone(), control.clone(), stopped(stop_rx.clone()));
+        tokio::spawn(async move {
+            if let Err(e) = api::serve(api_cfg, reg, control, stop).await {
+                error!(error = %format!("{e:#}"), "HTTP API stopped");
+            }
+        });
+    }
+    if let Some(m) = cfg.metrics.clone().filter(|m| m.enabled) {
+        let (reg, stop) = (reg.clone(), stopped(stop_rx.clone()));
+        tokio::spawn(async move {
+            if let Err(e) = api::serve_metrics(m.listen, reg, stop).await {
+                error!(error = %format!("{e:#}"), "metrics listener stopped");
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        let control = control.clone();
+        tokio::spawn(async move {
+            let Ok(mut hup) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            else {
+                return;
+            };
+            while hup.recv().await.is_some() {
+                info!("SIGHUP: reloading configuration");
+                let _ = control.reload().await;
+            }
+        });
+    }
+
+    if tui {
+        let (reg, control, rt) = (
+            reg.clone(),
+            control.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        let ui = tokio::task::spawn_blocking(move || tui::app::run(reg, control, rt));
+        tokio::select! {
+            r = ui => match r {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(error = %e, "terminal UI failed"),
+                Err(e) => warn!(error = %e, "terminal UI panicked"),
+            },
+            _ = terminate() => {}
+        }
+    } else {
+        terminate().await;
+    }
+
+    info!("shutting down");
+    let _ = stop_tx.send(true);
+    let _ = mgr_task.await;
     info!("io-to-net stopped");
     Ok(())
 }
 
-// ── Ring-buffer tracing writer ────────────────────────────────────────────────
-
-/// `MakeWriter` implementation that appends each formatted log line to the
-/// shared ring buffer instead of writing to stdout/stderr.
-#[derive(Clone)]
-struct RingMakeWriter {
-    buffer: Arc<parking_lot::Mutex<VecDeque<String>>>,
-}
-
-struct RingWriter {
-    buffer: Arc<parking_lot::Mutex<VecDeque<String>>>,
-}
-
-impl Write for RingWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Ok(s) = std::str::from_utf8(buf) {
-            let line = s.trim_end_matches('\n').to_string();
-            if !line.is_empty() {
-                let mut b = self.buffer.lock();
-                if b.len() >= 1000 {
-                    b.pop_front();
-                }
-                b.push_back(line);
-            }
-        }
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RingMakeWriter {
-    type Writer = RingWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        RingWriter { buffer: self.buffer.clone() }
-    }
-}
-
-// ── Logging init ─────────────────────────────────────────────────────────────
-
-fn init_logging(
-    level: &str,
-    daemon: bool,
-    ring: Option<Arc<parking_lot::Mutex<VecDeque<String>>>>,
-) {
-    use tracing_subscriber::{fmt, EnvFilter};
-
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
-
-    if daemon {
-        // Structured JSON logging for daemon / systemd
-        fmt::Subscriber::builder()
-            .with_env_filter(filter)
-            .json()
-            .init();
-    } else if let Some(buffer) = ring {
-        // TUI mode: write into the ring buffer; nothing reaches stdout.
-        fmt::Subscriber::builder()
-            .with_env_filter(filter)
-            .with_target(false)
-            .with_ansi(false)
-            .compact()
-            .with_writer(RingMakeWriter { buffer })
-            .init();
-    } else {
-        // Plain stdout (scan mode, tests, etc.)
-        fmt::Subscriber::builder()
-            .with_env_filter(filter)
-            .with_target(false)
-            .compact()
-            .init();
-    }
-}
-
-async fn wait_for_shutdown() {
+async fn terminate() {
     #[cfg(unix)]
     {
-        use signal::unix::{signal, SignalKind};
-        let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-        let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            return std::future::pending().await;
+        };
         tokio::select! {
-            _ = sigterm.recv() => { info!("Received SIGTERM"); }
-            _ = sigint.recv() => { info!("Received SIGINT"); }
+            _ = term.recv() => info!("SIGTERM received"),
+            _ = int.recv() => info!("SIGINT received"),
         }
     }
     #[cfg(not(unix))]
     {
-        signal::ctrl_c().await.expect("failed to install Ctrl-C handler");
-        info!("Received Ctrl-C");
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Ctrl-C received");
+    }
+}
+
+/// GET /health on the configured API address (wildcards become loopback).
+async fn healthcheck(listen: &str) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut addr: std::net::SocketAddr = listen
+        .parse()
+        .with_context(|| format!("http_api.listen {listen}"))?;
+    if addr.ip().is_unspecified() {
+        addr.set_ip(if addr.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    let fut = async {
+        let mut s = tokio::net::TcpStream::connect(addr).await?;
+        s.write_all(format!("GET /health HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes())
+            .await?;
+        let mut out = String::new();
+        s.read_to_string(&mut out).await?;
+        Ok::<_, std::io::Error>(out)
+    };
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+        .await
+        .context("health check timed out")?
+        .with_context(|| format!("cannot reach {addr}"))?;
+    let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+    println!("{body}");
+    if resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.0 200") {
+        Ok(())
+    } else {
+        anyhow::bail!("unhealthy")
+    }
+}
+
+/// Logs always go to the registry ring (TUI, API); headless also to stdout.
+fn init_logging(ring: Option<Arc<Registry>>, level: &str, stdout: bool, json: bool) {
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let ring_layer = ring.map(|reg| {
+        fmt::layer()
+            .with_ansi(false)
+            .with_target(false)
+            .compact()
+            .with_writer(RingWriter(reg))
+    });
+    let (text, json_layer) = match (stdout, json) {
+        (false, _) => (None, None),
+        (true, false) => (
+            Some(
+                fmt::layer()
+                    .with_target(false)
+                    .with_ansi(std::io::stdout().is_terminal())
+                    .compact(),
+            ),
+            None,
+        ),
+        (true, true) => (None, Some(fmt::layer().json())),
+    };
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(ring_layer)
+        .with(text)
+        .with(json_layer)
+        .try_init();
+}
+
+#[derive(Clone)]
+struct RingWriter(Arc<Registry>);
+
+impl std::io::Write for RingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let line = String::from_utf8_lossy(buf);
+        let line = line.trim_end();
+        if !line.is_empty() {
+            self.0.logs.push(line.to_string());
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RingWriter {
+    type Writer = RingWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
     }
 }

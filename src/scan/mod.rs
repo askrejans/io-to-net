@@ -1,3 +1,4 @@
+#[cfg(feature = "bluetooth")]
 pub mod bluetooth;
 pub mod gpio;
 pub mod i2c;
@@ -24,14 +25,20 @@ pub async fn run_scan(deep: bool, json: bool) {
     // BLE scan: deep mode does service discovery, quick mode just name+address.
     if !json {
         let mut out = String::new();
-        writeln!(out, "\nio-to-net — hardware device scan{}\n",
-            if deep { " (deep)" } else { "" }).unwrap();
+        writeln!(
+            out,
+            "\nio-to-net — hardware device scan{}\n",
+            if deep { " (deep)" } else { "" }
+        )
+        .unwrap();
 
         writeln!(out, "SERIAL").unwrap();
         if serials.is_empty() {
             writeln!(out, "  (none detected)").unwrap();
         } else {
-            for s in &serials { writeln!(out, "  {}", s).unwrap(); }
+            for s in &serials {
+                writeln!(out, "  {}", serial::describe(s)).unwrap();
+            }
         }
         writeln!(out).unwrap();
 
@@ -41,7 +48,9 @@ pub async fn run_scan(deep: bool, json: bool) {
             if i2c_buses.is_empty() {
                 writeln!(out, "  (none detected)").unwrap();
             } else {
-                for b in &i2c_buses { writeln!(out, "  {}", b).unwrap(); }
+                for b in &i2c_buses {
+                    writeln!(out, "  {}", b).unwrap();
+                }
             }
             writeln!(out).unwrap();
 
@@ -49,22 +58,30 @@ pub async fn run_scan(deep: bool, json: bool) {
             if gpio_chips.is_empty() {
                 writeln!(out, "  (none detected)").unwrap();
             } else {
-                for g in &gpio_chips { writeln!(out, "  {}", g).unwrap(); }
+                for g in &gpio_chips {
+                    writeln!(out, "  {}", g).unwrap();
+                }
             }
             writeln!(out).unwrap();
         }
 
-        writeln!(out, "BLUETOOTH (scanning for {}s...)",
-            if deep { 10 } else { 5 }).unwrap();
+        #[cfg(feature = "bluetooth")]
+        writeln!(
+            out,
+            "BLUETOOTH (scanning for {}s...)",
+            if deep { 10 } else { 5 }
+        )
+        .unwrap();
         print!("{}", out);
     }
 
-    let scan_duration = if deep {
-        std::time::Duration::from_secs(10)
-    } else {
-        std::time::Duration::from_secs(5)
+    #[cfg(feature = "bluetooth")]
+    let ble_devices = {
+        let scan_duration = std::time::Duration::from_secs(if deep { 10 } else { 5 });
+        bluetooth::scan_bluetooth_timed(scan_duration, deep).await
     };
-    let ble_devices = bluetooth::scan_bluetooth_timed(scan_duration, deep).await;
+    #[cfg(not(feature = "bluetooth"))]
+    let ble_devices: Vec<(String, String)> = Vec::new();
 
     if json {
         #[cfg(target_os = "linux")]
@@ -79,8 +96,11 @@ pub async fn run_scan(deep: bool, json: bool) {
             "serial": serials,
             "bluetooth": ble_devices.iter().map(|(a, n)| serde_json::json!({"address": a, "name": n})).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
-    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
+    } else if cfg!(feature = "bluetooth") {
         let mut ble_out = String::new();
         if ble_devices.is_empty() {
             writeln!(ble_out, "  (none detected)").unwrap();
@@ -103,10 +123,14 @@ fn probe_i2c_deep() -> Vec<String> {
     let mut results = Vec::new();
     for bus in buses {
         // Try to open each bus; list it if accessible.
-        if OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&bus).is_ok() {
+        if OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&bus)
+            .is_ok()
+        {
             results.push(bus);
         }
     }
     results
 }
-

@@ -1,157 +1,152 @@
-use std::collections::VecDeque;
+//! Interactive terminal UI. Runs on a blocking thread (terminal input is
+//! blocking) and reads the shared registry; actions go through the manager.
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use crossterm::ExecutableCommand;
-use parking_lot::RwLock;
-use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use crate::core::bridge_manager::BridgeManagerHandle;
-use crate::core::metrics::GlobalMetrics;
+use super::widgets;
+use crate::core::manager::Control;
+use crate::core::stats::{BridgeSnapshot, Registry};
 
-use super::widgets::draw;
-
-/// Which tab is currently visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
-    Ports,
-    Connections,
-    Stats,
+    Bridges,
+    Clients,
+    Monitor,
     Logs,
 }
 
+pub const TABS: [Tab; 4] = [Tab::Bridges, Tab::Clients, Tab::Monitor, Tab::Logs];
+
 impl Tab {
-    pub fn next(self) -> Self {
+    pub fn title(self) -> &'static str {
         match self {
-            Tab::Ports => Tab::Connections,
-            Tab::Connections => Tab::Stats,
-            Tab::Stats => Tab::Logs,
-            Tab::Logs => Tab::Ports,
+            Tab::Bridges => "Bridges",
+            Tab::Clients => "Clients",
+            Tab::Monitor => "Monitor",
+            Tab::Logs => "Logs",
         }
     }
-
-    pub fn prev(self) -> Self {
-        match self {
-            Tab::Ports => Tab::Logs,
-            Tab::Connections => Tab::Ports,
-            Tab::Stats => Tab::Connections,
-            Tab::Logs => Tab::Stats,
-        }
+    fn index(self) -> usize {
+        TABS.iter().position(|t| *t == self).unwrap_or(0)
     }
-
-    pub fn index(self) -> usize {
-        match self {
-            Tab::Ports => 0,
-            Tab::Connections => 1,
-            Tab::Stats => 2,
-            Tab::Logs => 3,
-        }
+    fn step(self, d: isize) -> Self {
+        TABS[(self.index() as isize + d).rem_euclid(TABS.len() as isize) as usize]
     }
 }
 
-/// Run the interactive TUI until the user presses 'q'.
-pub async fn run(
-    metrics: Arc<RwLock<GlobalMetrics>>,
-    log_buffer: Arc<parking_lot::Mutex<VecDeque<String>>>,
-    _bridge_handle: BridgeManagerHandle,
-) -> anyhow::Result<()> {
-    // Install a custom panic hook so that any panic (in any thread) tears down
-    // the terminal gracefully and writes the message to the log ring-buffer
-    // instead of to stderr, preventing raw text from bleeding into the TUI.
-    let ring_for_hook = log_buffer.clone();
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        // Best-effort terminal restore so the shell is usable after a crash.
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = std::io::Write::flush(&mut std::io::stderr());
-        let _ = crossterm::ExecutableCommand::execute(
-            &mut std::io::stderr(),
-            crossterm::terminal::LeaveAlternateScreen,
-        );
+pub struct App {
+    pub tab: Tab,
+    pub selected: usize,
+    pub bridges: Vec<BridgeSnapshot>,
+    pub monitor: Vec<crate::core::stats::Chunk>,
+    pub logs: Vec<String>,
+    pub notice: String,
+    pub uptime_s: u64,
+    pub log_scroll: usize,
+}
 
-        let msg = format!("PANIC: {}", info);
-        {
-            let mut b = ring_for_hook.lock();
-            if b.len() >= 1000 { b.pop_front(); }
-            b.push_back(msg.clone());
-        }
-        // Also call the original hook so the message appears after the TUI
-        // has left the alternate screen (visible in the normal terminal scroll-back).
-        prev_hook(info);
-    }));
+impl App {
+    pub fn selected_name(&self) -> Option<&str> {
+        self.bridges.get(self.selected).map(|b| b.name.as_str())
+    }
+}
 
-    // Set up terminal
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    stdout.execute(EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    // Force ratatui to repaint every cell on first draw, covering any stale
-    // content that may be present in the alternate screen buffer.
-    terminal.clear()?;
-
-    let mut current_tab = Tab::Ports;
-    let tick = Duration::from_millis(100);
-
-    loop {
-        // Take a snapshot of metrics to avoid holding lock while rendering
-        let metrics_snapshot = {
-            let mut m = metrics.write();
-            for bm in m.bridges.values_mut() {
-                bm.update_rates();
+pub fn run(reg: Arc<Registry>, control: Control, rt: tokio::runtime::Handle) -> anyhow::Result<()> {
+    let mut terminal = ratatui::try_init()?;
+    let (notice_tx, notice_rx) = std::sync::mpsc::channel::<String>();
+    let mut app = App {
+        tab: Tab::Bridges,
+        selected: 0,
+        bridges: Vec::new(),
+        monitor: Vec::new(),
+        logs: Vec::new(),
+        notice: "↑↓ select  r restart  R reload config  Tab/1-4 view  q quit".into(),
+        uptime_s: 0,
+        log_scroll: 0,
+    };
+    let result = (|| -> anyhow::Result<()> {
+        loop {
+            app.bridges = reg.bridges().iter().map(|b| b.snapshot()).collect();
+            app.selected = app.selected.min(app.bridges.len().saturating_sub(1));
+            app.monitor = app
+                .selected_name()
+                .and_then(|n| reg.bridge(n))
+                .map(|b| b.monitor_since(0))
+                .unwrap_or_default();
+            app.logs = reg.logs.tail(500);
+            app.uptime_s = reg.uptime_s();
+            while let Ok(n) = notice_rx.try_recv() {
+                app.notice = n;
             }
-            m.clone()
-        };
+            terminal.draw(|f| widgets::draw(f, &app))?;
 
-        let logs_snapshot = {
-            let buf = log_buffer.lock();
-            buf.iter().rev().take(200).cloned().collect::<Vec<_>>()
-        };
-
-        terminal.draw(|frame| {
-            draw(frame, &metrics_snapshot, &logs_snapshot, current_tab);
-        })?;
-
-        // Poll for input events
-        if event::poll(tick)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                        KeyCode::Tab | KeyCode::Right => { current_tab = current_tab.next(); }
-                        KeyCode::BackTab | KeyCode::Left => { current_tab = current_tab.prev(); }
-                        KeyCode::Char('1') => { current_tab = Tab::Ports; }
-                        KeyCode::Char('2') => { current_tab = Tab::Connections; }
-                        KeyCode::Char('3') => { current_tab = Tab::Stats; }
-                        KeyCode::Char('4') => { current_tab = Tab::Logs; }
-                        _ => {}
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(());
+                }
+                KeyCode::Tab | KeyCode::Right => app.tab = app.tab.step(1),
+                KeyCode::BackTab | KeyCode::Left => app.tab = app.tab.step(-1),
+                KeyCode::Char(c @ '1'..='4') => app.tab = TABS[(c as u8 - b'1') as usize],
+                KeyCode::Up if app.tab == Tab::Logs => app.log_scroll += 1,
+                KeyCode::Down if app.tab == Tab::Logs => {
+                    app.log_scroll = app.log_scroll.saturating_sub(1)
+                }
+                KeyCode::Up => app.selected = app.selected.saturating_sub(1),
+                KeyCode::Down => {
+                    app.selected = (app.selected + 1).min(app.bridges.len().saturating_sub(1))
+                }
+                KeyCode::Char('r') => {
+                    if let Some(b) = app.selected_name().and_then(|n| reg.bridge(n)) {
+                        b.restart.notify_one();
+                        app.notice = format!("restarting {}", b.name);
                     }
                 }
+                KeyCode::Char('R') => {
+                    app.notice = "reloading configuration…".into();
+                    let (control, tx) = (control.clone(), notice_tx.clone());
+                    rt.spawn(async move {
+                        let msg = match control.reload().await {
+                            Ok(s) => format!(
+                                "reloaded: {} started, {} restarted, {} stopped, {} unchanged",
+                                s.started.len(),
+                                s.restarted.len(),
+                                s.stopped.len(),
+                                s.unchanged.len()
+                            ),
+                            Err(e) => format!("reload failed: {e}"),
+                        };
+                        let _ = tx.send(msg);
+                    });
+                }
+                _ => {}
             }
         }
-    }
-
-    // Restore terminal and panic hook
-    disable_raw_mode()?;
-    terminal.backend_mut().execute(LeaveAlternateScreen)?;
-    // Reinstall the default panic hook now that the TUI is gone.
-    std::panic::set_hook(Box::new(move |info| {
-        eprintln!("{}", info);
-    }));
-    Ok(())
+    })();
+    ratatui::restore();
+    result
 }
 
-impl Clone for GlobalMetrics {
-    fn clone(&self) -> Self {
-        GlobalMetrics {
-            bridges: self.bridges.clone(),
-            connections: self.connections.clone(),
-            start_time: self.start_time,
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tabs_wrap() {
+        assert_eq!(Tab::Bridges.step(-1), Tab::Logs);
+        assert_eq!(Tab::Logs.step(1), Tab::Bridges);
+        assert_eq!(Tab::Clients.step(1), Tab::Monitor);
     }
 }
